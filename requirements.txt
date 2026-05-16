@@ -1,0 +1,50 @@
+# Binance Options-Driven Futures Signal Generator
+# Requirements File
+# ============================================
+# Updated: 2026-05-17 - Using new modular Binance SDKs
+
+# Binance SDKs (New Modular Structure)
+# -------------------------------------
+# Options Trading SDK (for /eapi/* endpoints)
+binance-sdk-derivatives-trading-options>=1.0.0
+
+# USDS-M Futures SDK (for /fapi/* endpoints - USDT-margined)
+binance-sdk-derivatives-trading-usds-futures>=1.0.0
+
+# Common Binance dependencies (installed automatically with SDKs)
+binance-common>=1.0.0
+
+# Core Dependencies
+# -----------------
+pyyaml>=6.0                       # YAML configuration parsing
+pydantic>=2.0                     # Data validation and models
+aiohttp>=3.8.0                    # Async HTTP client
+python-dotenv>=1.0.0              # Load environment variables from .env files
+
+# Data Processing
+# ---------------
+python-dateutil>=2.8.0            # Date/time utilities
+typing-extensions>=4.0.0          # Enhanced type hints
+
+# Logging
+# -------
+structlog>=23.0.0                 # Structured logging
+
+# Testing Dependencies (dev)
+# --------------------------
+pytest>=7.0.0                     # Testing framework
+pytest-asyncio>=0.21.0            # Async test support
+pytest-cov>=4.0.0                 # Coverage reporting
+pytest-mock>=3.10.0               # Mocking utilities
+
+# Code Quality (dev)
+# ------------------
+black>=23.0.0                     # Code formatter
+ruff>=0.1.0                       # Fast linter
+mypy>=1.0.0                       # Static type checker
+pre-commit>=3.0.0                 # Git hooks
+
+# Documentation (dev)
+# -------------------
+sphinx>=6.0.0                     # Documentation generator
+sphinx-rtd-theme>=1.0.0           # Read the Docs theme
