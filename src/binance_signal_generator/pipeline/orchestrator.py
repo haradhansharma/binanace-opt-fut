@@ -574,9 +574,16 @@ class PipelineOrchestrator:
             # Run advanced analysis methods for detailed metrics FIRST
             # These are now used in signal scoring (Section 6.5 implementation)
             
-            # 1. IV Term Structure (requires multiple chains - skipped for single chain)
-            # Note: IV Term Structure requires fetching multiple expiry chains
-            # This would require API changes to fetch multiple expiries
+            # IMPROVED: IV-003 - IV Term Structure analysis
+            # Analyze IV term structure from the chain data
+            # For proper multi-expiry analysis, would need to fetch chains by individual expiry
+            iv_term_structure = self.iv_analyzer.analyze_term_structure_from_chain(options_chain)
+            iv_term_signal, iv_term_confidence, iv_term_details = self.iv_analyzer.generate_term_structure_signal(iv_term_structure)
+            
+            logger.debug(
+                f"IV Term Structure for {symbol}: shape={iv_term_structure.get('shape', 'N/A')}, "
+                f"signal={iv_term_signal.value}, confidence={iv_term_confidence}"
+            )
             
             # 2. PCR by Strike Analysis
             pcr_by_strike = self.pcr_analyzer.analyze_pcr_by_strike(options_chain)
@@ -601,11 +608,13 @@ class PipelineOrchestrator:
                 }
             
             # Create advanced_metrics dict for signal scoring
+            # IMPROVED: IV-003 - Added IV term structure to advanced metrics
             advanced_metrics = {
                 "pcr_by_strike": pcr_by_strike,
                 "oi_distribution": oi_distribution,
                 "pain_distribution": pain_distribution,
                 "oi_flow": oi_flow,
+                "iv_term_structure": iv_term_structure,
             }
             
             # Run Options analysis with sentiment, gamma exposure, and advanced metrics

@@ -28,8 +28,11 @@ logger = get_logger(__name__)
 @dataclass
 class OIConfig:
     """Configuration for OI analysis."""
-    # OI concentration thresholds
-    high_oi_concentration: float = 0.15   # 15% of total OI at one strike
+    # IMPROVED: OI-002 - Lowered threshold from 15% to 4% for crypto markets
+    # Crypto options have distributed OI; 15% threshold was too high to detect walls
+    # With ~18K total OI across 70+ strikes, max single-strike OI is ~0.67%
+    # 4% threshold (3-5% range) captures meaningful concentrations in crypto
+    high_oi_concentration: float = 0.04   # 4% of total OI at one strike (crypto-optimized)
     significant_oi_change: float = 0.20    # 20% change is significant
     
     # Strike analysis

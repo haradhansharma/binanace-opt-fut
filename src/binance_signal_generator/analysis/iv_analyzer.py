@@ -267,14 +267,32 @@ class IVAnalyzer:
         """
         Generate trading signal from IV analysis.
         
-        Signal Logic (Enhanced for crypto - Section 6.5 Priority 2):
-        - High IV (>0.80 value or >75th percentile) + Positive Skew = Bearish (panic pricing)
-        - Low IV (<0.40 value or <25th percentile) + Negative Skew = Bullish (complacency)
-        - Normal IV = Neutral
+        IMPROVED: IV-004 - Revised IV skew signal logic for better interpretation
         
-        For crypto, we use BOTH value-based and percentile-based thresholds:
-        - Value-based: More absolute, good for comparing across assets
-        - Percentile-based: Better for relative positioning
+        Signal Logic (Enhanced for crypto with contrarian interpretation):
+        
+        IV Skew Interpretation:
+        - Positive Skew (Put IV > Call IV): Indicates demand for downside protection
+          Traditional view: Bearish sentiment → SHORT signal
+          Contrarian view: Could indicate hedged longs (institutions bullish)
+        
+        - Negative Skew (Call IV > Put IV): Indicates demand for upside exposure
+          Traditional view: Bullish sentiment → LONG signal
+          Contrarian view: Could indicate crowded longs (retail FOMO)
+        
+        For crypto retail trading, we use a MODIFIED CONTRARIAN approach:
+        - Extreme IV + Extreme Skew = Follow the skew (momentum)
+        - Moderate IV + Moderate Skew = Fade the skew (contrarian)
+        
+        High IV + Positive Skew:
+        - Could mean: Panic hedging or speculative put buying
+        - If IV is extreme (>85%), likely panic → SHORT (follow momentum)
+        - If IV is moderate (75-85%), could be hedged longs → LONG (contrarian)
+        
+        Low IV + Negative Skew:
+        - Could mean: Complacency or speculative call buying
+        - If IV is extreme (<25%), likely complacency → LONG (follow momentum)
+        - If IV is moderate (25-40%), could be crowded longs → SHORT (contrarian)
         
         Args:
             iv_percentile: IV percentile
@@ -285,47 +303,65 @@ class IVAnalyzer:
             Tuple of (SignalDirection, confidence)
         """
         # Use value-based thresholds for crypto (more reliable)
-        # These are configurable in IVConfig
         iv_high_value = self.config.iv_high_value  # Default 0.80 (80% annualized)
         iv_low_value = self.config.iv_low_value     # Default 0.40 (40% annualized)
         
         # Determine IV state using BOTH value and percentile
         is_high_iv = atm_iv >= iv_high_value or iv_percentile >= self.config.iv_high_threshold
         is_low_iv = atm_iv <= iv_low_value or iv_percentile <= self.config.iv_low_threshold
+        is_extreme_high_iv = atm_iv >= 1.0 or iv_percentile >= 0.90  # 100%+ IV or 90th percentile
+        is_extreme_low_iv = atm_iv <= 0.25 or iv_percentile <= 0.10  # 25% IV or 10th percentile
         
         # High IV regime
         if is_high_iv:
-            # Positive skew confirms bearish sentiment
-            if iv_skew > 0.05:
-                return SignalDirection.SHORT, 0.7
+            # IMPROVED: IV-004 - Distinguish between extreme and moderate IV
+            if iv_skew > 0.05:  # Significant positive skew (put demand)
+                if is_extreme_high_iv:
+                    # Extreme IV + positive skew = panic pricing → SHORT (follow momentum)
+                    # High put demand confirms downside fear
+                    return SignalDirection.SHORT, 0.75
+                else:
+                    # Moderate high IV + positive skew = could be institutional hedging
+                    # Institutions hedging longs = contrarian LONG signal
+                    # This is the key fix: don't always SHORT on positive skew
+                    return SignalDirection.LONG, 0.45  # Contrarian signal
             elif iv_skew > 0:
-                return SignalDirection.SHORT, 0.5
+                if is_extreme_high_iv:
+                    return SignalDirection.SHORT, 0.55
+                else:
+                    return SignalDirection.NEUTRAL, 0.3
             else:
-                # High IV but no skew = neutral (less bearish signal)
-                # For crypto, high IV without skew still indicates potential volatility
-                # Could be a neutral or slight short bias
+                # High IV but negative/neutral skew
+                # Could indicate call demand despite high IV
                 return SignalDirection.NEUTRAL, 0.3
         
         # Low IV regime
         elif is_low_iv:
-            # Negative skew suggests bullish bias
-            if iv_skew < -0.05:
-                return SignalDirection.LONG, 0.6
+            if iv_skew < -0.05:  # Significant negative skew (call demand)
+                if is_extreme_low_iv:
+                    # Extreme low IV + call demand = potential breakout → LONG
+                    return SignalDirection.LONG, 0.65
+                else:
+                    # Moderate low IV + call demand = could be crowded longs
+                    # Contrarian: fade the call demand
+                    return SignalDirection.SHORT, 0.35  # Contrarian signal
             elif iv_skew < 0:
-                return SignalDirection.LONG, 0.4
+                if is_extreme_low_iv:
+                    return SignalDirection.LONG, 0.50
+                else:
+                    return SignalDirection.NEUTRAL, 0.3
             else:
-                # Low IV without skew - still potentially bullish for crypto
-                # Low IV periods often precede price moves
+                # Low IV with positive/neutral skew
                 return SignalDirection.LONG, 0.35
         
-        # Normal IV regime - use value proximity for gradient signals
+        # Normal IV regime
         else:
             # If IV is trending toward high/low, provide weak signals
             if atm_iv > (iv_high_value * 0.9):  # Approaching high
-                if iv_skew > 0:
+                if iv_skew > 0.03:
                     return SignalDirection.SHORT, 0.25
             elif atm_iv < (iv_low_value * 1.1):  # Approaching low
-                if iv_skew < 0:
+                if iv_skew < -0.03:
                     return SignalDirection.LONG, 0.25
             
             return SignalDirection.NEUTRAL, 0.2
@@ -422,3 +458,185 @@ class IVAnalyzer:
             "INSUFFICIENT_DATA": "Not enough expiry data",
         }
         return interpretations.get(shape, "Unknown")
+    
+    def generate_term_structure_signal(
+        self,
+        term_structure_analysis: Dict[str, Any],
+    ) -> tuple:
+        """
+        IMPROVED: IV-003 - Generate trading signal from IV term structure.
+        
+        IV Term Structure Signal Logic:
+        
+        Inverted Term Structure (Short IV > Long IV):
+        - Short-term IV elevated relative to long-term
+        - Indicates expectation of near-term volatility event
+        - Often precedes significant price moves
+        - Signal: Look for direction from other indicators, but prepare for volatility
+        
+        Upward Term Structure (Long IV > Short IV):
+        - Normal market conditions
+        - Long-term uncertainty priced higher than short-term
+        - Signal: Neutral to continuation of current trend
+        
+        Flat Term Structure:
+        - Uniform expectations across time
+        - No significant events expected
+        - Signal: Neutral
+        
+        Signal Strength:
+        - More inverted = stronger signal
+        - Steep upward = normal, weak signal
+        
+        Args:
+            term_structure_analysis: Output from analyze_iv_term_structure()
+            
+        Returns:
+            Tuple of (SignalDirection, confidence, signal_details)
+        """
+        shape = term_structure_analysis.get("shape", "INSUFFICIENT_DATA")
+        term_structure = term_structure_analysis.get("term_structure", [])
+        
+        if shape == "INSUFFICIENT_DATA" or len(term_structure) < 2:
+            return SignalDirection.NEUTRAL, 0.0, {"reason": "Insufficient expiry data"}
+        
+        # Calculate term structure metrics
+        short_iv = term_structure[0]["atm_iv"]
+        long_iv = term_structure[-1]["atm_iv"]
+        short_dte = term_structure[0]["days_to_expiry"]
+        long_dte = term_structure[-1]["days_to_expiry"]
+        
+        # Calculate inversion ratio
+        if long_iv > 0:
+            inversion_ratio = (short_iv - long_iv) / long_iv
+        else:
+            inversion_ratio = 0.0
+        
+        signal = SignalDirection.NEUTRAL
+        confidence = 0.0
+        details = {
+            "shape": shape,
+            "short_iv": round(short_iv, 4),
+            "long_iv": round(long_iv, 4),
+            "inversion_ratio": round(inversion_ratio, 4),
+            "short_dte": short_dte,
+            "long_dte": long_dte,
+        }
+        
+        if shape == "INVERTED":
+            # Inverted term structure - near-term volatility expected
+            # The more inverted, the stronger the signal
+            # However, direction is unclear from term structure alone
+            # We use inversion magnitude for confidence
+            
+            if inversion_ratio > 0.3:
+                # Strongly inverted - significant event expected
+                confidence = 0.6
+                details["interpretation"] = "Strongly inverted - major near-term volatility expected"
+            elif inversion_ratio > 0.15:
+                # Moderately inverted
+                confidence = 0.4
+                details["interpretation"] = "Moderately inverted - near-term event expected"
+            else:
+                # Slightly inverted
+                confidence = 0.25
+                details["interpretation"] = "Slightly inverted - minor near-term event possible"
+            
+            # Direction: Inverted term often precede downside moves in crypto
+            # But can also precede upside breakouts
+            # Use skew from other analysis for direction
+            # Default to NEUTRAL with confidence for volatility expectation
+            signal = SignalDirection.NEUTRAL
+            details["volatility_expected"] = True
+            
+        elif shape == "UPWARD":
+            # Normal upward sloping term structure
+            # Higher long-term IV = more uncertainty about future
+            
+            if long_iv > short_iv * 1.3:
+                # Steep upward - significant long-term uncertainty
+                confidence = 0.3
+                details["interpretation"] = "Steep upward - significant long-term uncertainty"
+            else:
+                # Normal upward - standard conditions
+                confidence = 0.15
+                details["interpretation"] = "Normal upward term structure"
+            
+            signal = SignalDirection.NEUTRAL
+            details["volatility_expected"] = False
+            
+        else:  # FLAT
+            # Flat term structure - uniform expectations
+            confidence = 0.1
+            signal = SignalDirection.NEUTRAL
+            details["interpretation"] = "Flat term structure - stable expectations"
+            details["volatility_expected"] = False
+        
+        return signal, round(confidence, 3), details
+    
+    def analyze_term_structure_from_chain(
+        self,
+        chain: OptionsChain,
+    ) -> Dict[str, Any]:
+        """
+        IMPROVED: IV-003 - Extract and analyze IV term structure from a single chain.
+        
+        This method extracts IV data by expiration from the chain's strike data.
+        It groups options by their expiration dates (extracted from symbol naming)
+        and calculates IV for each expiration.
+        
+        Binance option symbol format: BTC-260626-140000-C (ASSET-EXPIRY-STRIKE-C/P)
+        
+        Args:
+            chain: Options chain data (contains all expirations)
+            
+        Returns:
+            Dictionary with term structure analysis and signal
+        """
+        from collections import defaultdict
+        
+        # Extract IV by expiration from strike data
+        # We need to infer expiration from the data
+        # Since OptionsChain doesn't store symbol-level expiration info directly,
+        # we use the chain's avg_call_iv and avg_put_iv as proxies for the aggregate
+        
+        # For a proper term structure, we would need symbol-level data
+        # This is a simplified version using available chain data
+        
+        # Check if chain has expiration info
+        if hasattr(chain, 'expiry') and chain.expiry:
+            # Single expiry chain
+            days_to_expiry = (chain.expiry - datetime.utcnow()).days if chain.expiry else 0
+            atm_iv = self._calculate_atm_iv(chain)
+            
+            term_structure = [{
+                "expiry": chain.expiry.isoformat() if chain.expiry else None,
+                "days_to_expiry": max(days_to_expiry, 0),
+                "atm_iv": round(atm_iv, 4),
+            }]
+            
+            # Single expiry - cannot determine term structure shape
+            return {
+                "term_structure": term_structure,
+                "shape": "SINGLE_EXPIRY",
+                "interpretation": "Single expiry - term structure analysis requires multiple expirations",
+                "signal": SignalDirection.NEUTRAL.value,
+                "confidence": 0.0,
+            }
+        
+        # Use chain's average IVs as aggregate proxy
+        # Note: This is less accurate than per-expiry analysis
+        avg_iv = (chain.avg_call_iv + chain.avg_put_iv) / 2 if (chain.avg_call_iv > 0 and chain.avg_put_iv > 0) else self._calculate_atm_iv(chain)
+        
+        return {
+            "term_structure": [{
+                "expiry": "AGGREGATE",
+                "days_to_expiry": 0,
+                "atm_iv": round(avg_iv, 4),
+            }],
+            "shape": "AGGREGATE",
+            "interpretation": "Aggregate IV from combined expirations - for proper term structure, fetch chains by individual expiry",
+            "signal": SignalDirection.NEUTRAL.value,
+            "confidence": 0.0,
+            "note": "IV-003: Term structure requires fetching multiple expiry-specific chains. Use analyze_iv_term_structure() with separate chains.",
+        }

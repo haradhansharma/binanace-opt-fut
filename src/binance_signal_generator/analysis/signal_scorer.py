@@ -47,10 +47,14 @@ class SignalScorerConfig:
     gamma_weight: float = 0.10        # Reduced from 0.12
     
     # Advanced metrics weights (NEW - Section 6.5 implementation)
-    oi_flow_weight: float = 0.05      # OI flow direction (BUILDING/UNWINDING)
+    # IMPROVED: OI-001 - Increased OI flow weight from 5% to 12% (critical signal)
+    oi_flow_weight: float = 0.12      # OI flow direction (BUILDING/UNWINDING) - PRIMARY signal
     wall_concentration_weight: float = 0.04   # Wall concentration from whale analysis
-    pcr_strike_alignment_weight: float = 0.03  # PCR strike alignment
+    # IMPROVED: PCR-004 - Increased PCR strike alignment weight from 3% to 8%
+    pcr_strike_alignment_weight: float = 0.08  # PCR strike alignment - enhanced significance
     whale_flow_weight: float = 0.05   # Whale money flow analysis
+    # IMPROVED: IV-003 - Added IV term structure weight
+    iv_term_structure_weight: float = 0.03  # IV term structure signal
     
     # Minimum confidence for valid signal
     min_confidence: float = 0.4
@@ -158,6 +162,8 @@ class SignalScorer:
         wall_conc_signal, wall_conc_confidence = self._derive_wall_concentration_signal(wall_analysis, whale_volume_analysis)
         pcr_strike_signal, pcr_strike_confidence = self._derive_pcr_strike_signal(advanced_metrics, chain.spot_price)
         whale_flow_signal, whale_flow_confidence = self._derive_whale_flow_signal(whale_volume_analysis)
+        # IMPROVED: IV-003 - Derive IV term structure signal
+        iv_term_signal, iv_term_confidence = self._derive_iv_term_structure_signal(advanced_metrics)
         
         # Debug logging
         sentiment_str = ""
@@ -192,6 +198,9 @@ class SignalScorer:
             pcr_strike_confidence=pcr_strike_confidence,
             whale_flow_signal=whale_flow_signal,
             whale_flow_confidence=whale_flow_confidence,
+            # IMPROVED: IV-003 - Added IV term structure signal
+            iv_term_signal=iv_term_signal,
+            iv_term_confidence=iv_term_confidence,
         )
         
         return OptionsSignal(
@@ -511,6 +520,77 @@ class SignalScorer:
         
         return signal, round(min(confidence, 0.85), 3)
     
+    def _derive_iv_term_structure_signal(
+        self,
+        advanced_metrics: Optional[Dict[str, Any]],
+    ) -> tuple:
+        """
+        IMPROVED: IV-003 - Derive trading signal from IV term structure analysis.
+        
+        IV Term Structure Signal Logic:
+        - INVERTED (Short IV > Long IV): Near-term volatility expected
+          - Strong inversion: Prepare for significant price move
+          - Direction determined by other signals
+        - UPWARD (Long IV > Short IV): Normal term structure
+          - Standard market conditions
+        - FLAT: Uniform IV expectations
+        
+        Signal Weight:
+        - IV term structure is primarily a volatility indicator
+        - Direction is typically NEUTRAL (use other signals for direction)
+        - Confidence indicates expected volatility magnitude
+        
+        Args:
+            advanced_metrics: Dict with iv_term_structure data
+            
+        Returns:
+            Tuple of (SignalDirection, confidence)
+        """
+        if not advanced_metrics:
+            return SignalDirection.NEUTRAL, 0.0
+        
+        iv_term_structure = advanced_metrics.get("iv_term_structure")
+        if not iv_term_structure:
+            return SignalDirection.NEUTRAL, 0.0
+        
+        shape = iv_term_structure.get("shape", "INSUFFICIENT_DATA")
+        term_structure = iv_term_structure.get("term_structure", [])
+        
+        if shape == "INSUFFICIENT_DATA" or shape == "SINGLE_EXPIRY" or shape == "AGGREGATE":
+            return SignalDirection.NEUTRAL, 0.0
+        
+        # Calculate inversion ratio if we have multiple expiries
+        if len(term_structure) >= 2:
+            short_iv = term_structure[0].get("atm_iv", 0)
+            long_iv = term_structure[-1].get("atm_iv", 0)
+            
+            if long_iv > 0:
+                inversion_ratio = (short_iv - long_iv) / long_iv
+            else:
+                inversion_ratio = 0.0
+            
+            if shape == "INVERTED":
+                # Inverted term indicate near-term volatility
+                # Use inversion magnitude for confidence
+                if inversion_ratio > 0.3:
+                    return SignalDirection.NEUTRAL, 0.5  # High volatility expected
+                elif inversion_ratio > 0.15:
+                    return SignalDirection.NEUTRAL, 0.35
+                else:
+                    return SignalDirection.NEUTRAL, 0.2
+            
+            elif shape == "UPWARD":
+                # Normal upward sloping
+                if long_iv > short_iv * 1.3:
+                    return SignalDirection.NEUTRAL, 0.15
+                else:
+                    return SignalDirection.NEUTRAL, 0.1
+            
+            else:  # FLAT
+                return SignalDirection.NEUTRAL, 0.05
+        
+        return SignalDirection.NEUTRAL, 0.0
+    
     def _combine_signals(
         self,
         iv_analysis: IVAnalysis,
@@ -528,6 +608,9 @@ class SignalScorer:
         pcr_strike_confidence: float = 0.0,
         whale_flow_signal: SignalDirection = SignalDirection.NEUTRAL,
         whale_flow_confidence: float = 0.0,
+        # IMPROVED: IV-003 - Added IV term structure signal parameters
+        iv_term_signal: SignalDirection = SignalDirection.NEUTRAL,
+        iv_term_confidence: float = 0.0,
     ) -> tuple:
         """
         Combine multiple signals into one.
@@ -548,6 +631,8 @@ class SignalScorer:
             pcr_strike_confidence: Confidence of PCR strike signal
             whale_flow_signal: Signal from whale money flow (NEW)
             whale_flow_confidence: Confidence of whale flow signal
+            iv_term_signal: Signal from IV term structure (IV-003)
+            iv_term_confidence: Confidence of IV term structure signal
             
         Returns:
             Tuple of (SignalDirection, confidence, raw_score)
@@ -578,6 +663,8 @@ class SignalScorer:
         signals["wall_conc"] = self._signal_to_numeric(wall_conc_signal) * wall_conc_confidence
         signals["pcr_strike"] = self._signal_to_numeric(pcr_strike_signal) * pcr_strike_confidence
         signals["whale_flow"] = self._signal_to_numeric(whale_flow_signal) * whale_flow_confidence
+        # IMPROVED: IV-003 - Add IV term structure signal
+        signals["iv_term"] = self._signal_to_numeric(iv_term_signal) * iv_term_confidence
         
         # Apply weights (core + advanced)
         weighted_signals = {
@@ -592,6 +679,8 @@ class SignalScorer:
             "wall_conc": signals["wall_conc"] * self.config.wall_concentration_weight,
             "pcr_strike": signals["pcr_strike"] * self.config.pcr_strike_alignment_weight,
             "whale_flow": signals["whale_flow"] * self.config.whale_flow_weight,
+            # IMPROVED: IV-003 - Add IV term structure weight
+            "iv_term": signals["iv_term"] * self.config.iv_term_structure_weight,
         }
         
         # Calculate raw score
