@@ -766,13 +766,12 @@ class PipelineOrchestrator:
         )
 
         # Calculate SMART Stop Loss with priority-based selection
+        # Uses pre-built support/resistance levels (no double calculation)
         stop_loss = self._calculate_smart_stop_loss(
             current_price=current_price,
             direction=options_signal.direction,
-            wall_analysis=wall_analysis,
-            pcr_by_strike=pcr_by_strike,
-            gamma_analysis=gamma_analysis,
-            options_chain=options_chain,
+            support_levels=support_levels,
+            resistance_levels=resistance_levels,
             max_distance_pct=max_sl_distance_pct,
         )
 
@@ -1235,28 +1234,28 @@ class PipelineOrchestrator:
         self,
         current_price: float,
         direction: SignalDirection,
-        wall_analysis: Optional[Any],
-        pcr_by_strike: Optional[Dict[str, Any]],
-        gamma_analysis: Optional[Any],
-        options_chain: OptionsChain,
+        support_levels: List[Dict],
+        resistance_levels: List[Dict],
         max_distance_pct: float = 3.0,
     ) -> StopLoss:
         """
-        Calculate smart stop loss with priority-based selection.
+        Calculate smart stop loss using pre-built support/resistance levels.
+        
+        No double calculation - reuses levels already built by:
+        - _build_support_levels_with_type()
+        - _build_resistance_levels_with_type()
         
         Priority:
-        1. WALL_BASED (if within max_distance_pct)
-        2. PCR_SUPPORT/PCR_RESISTANCE (if within max_distance_pct)
-        3. GAMMA_SUPPORT/GAMMA_RESISTANCE (if within max_distance_pct)
+        1. PUT_WALL / CALL_WALL (strongest)
+        2. PCR_SUPPORT / PCR_RESISTANCE
+        3. GAMMA_SUPPORT / GAMMA_RESISTANCE
         4. PERCENTAGE fallback (2%)
         
         Args:
             current_price: Current asset price
             direction: Signal direction (LONG/SHORT)
-            wall_analysis: Wall detection analysis
-            pcr_by_strike: PCR analysis by strike
-            gamma_analysis: Gamma exposure analysis
-            options_chain: Options chain data
+            support_levels: Pre-built support levels with type and strength
+            resistance_levels: Pre-built resistance levels with type and strength
             max_distance_pct: Maximum acceptable SL distance
             
         Returns:
@@ -1265,72 +1264,36 @@ class PipelineOrchestrator:
         sl_candidates = []  # List of (price, distance_pct, type, confidence)
         
         if direction == SignalDirection.LONG:
-            # For LONG: SL below price (support levels)
-            
-            # 1. Check PUT_WALLS
-            if wall_analysis and wall_analysis.put_walls:
-                for wall in wall_analysis.put_walls:
-                    sl_distance = (current_price - wall.strike) / current_price * 100
-                    if 0 < sl_distance <= max_distance_pct:
-                        confidence = wall.strength_score + min(wall.oi_percentage * 2, 0.3)
-                        sl_candidates.append((wall.strike, sl_distance, "WALL_BASED", confidence))
-            
-            # 2. Check PCR_SUPPORT (put-heavy strikes)
-            if pcr_by_strike and options_chain:
-                strike_pcrs = pcr_by_strike.get("strike_pcrs", [])
-                for strike_info in strike_pcrs:
-                    strike = strike_info.get("strike", 0)
-                    pcr = strike_info.get("pcr", 1.0)
-                    
-                    if strike < current_price and pcr >= 2.0:
-                        sl_distance = (current_price - strike) / current_price * 100
-                        if 0 < sl_distance <= max_distance_pct:
-                            confidence = min(pcr / 10.0, 0.9)
-                            sl_candidates.append((strike, sl_distance, "PCR_SUPPORT", confidence))
-            
-            # 3. Check GAMMA_SUPPORT
-            if gamma_analysis and gamma_analysis.gex_support_levels:
-                for gamma_level in gamma_analysis.gex_support_levels:
-                    sl_distance = (current_price - gamma_level.strike) / current_price * 100
-                    if 0 < sl_distance <= max_distance_pct:
-                        confidence = gamma_level.strength * 0.8
-                        sl_candidates.append((gamma_level.strike, sl_distance, "GAMMA_SUPPORT", confidence))
+            # For LONG: SL below price (use support levels)
+            for level in support_levels:
+                distance_pct = level.get("distance_pct", 0)
+                if 0 < distance_pct <= max_distance_pct:
+                    level_type = level.get("type", "SUPPORT")
+                    strength = level.get("strength", 0.5)
+                    sl_candidates.append((
+                        level["price"],
+                        distance_pct,
+                        level_type,
+                        strength,
+                    ))
         
         else:  # SHORT
-            # For SHORT: SL above price (resistance levels)
-            
-            # 1. Check CALL_WALLS
-            if wall_analysis and wall_analysis.call_walls:
-                for wall in wall_analysis.call_walls:
-                    sl_distance = (wall.strike - current_price) / current_price * 100
-                    if 0 < sl_distance <= max_distance_pct:
-                        confidence = wall.strength_score + min(wall.oi_percentage * 2, 0.3)
-                        sl_candidates.append((wall.strike, sl_distance, "WALL_BASED", confidence))
-            
-            # 2. Check PCR_RESISTANCE (call-heavy strikes)
-            if pcr_by_strike and options_chain:
-                strike_pcrs = pcr_by_strike.get("strike_pcrs", [])
-                for strike_info in strike_pcrs:
-                    strike = strike_info.get("strike", 0)
-                    pcr = strike_info.get("pcr", 1.0)
-                    
-                    if strike > current_price and pcr <= 0.5:
-                        sl_distance = (strike - current_price) / current_price * 100
-                        if 0 < sl_distance <= max_distance_pct:
-                            confidence = min((1.0 - pcr) * 2, 0.9)
-                            sl_candidates.append((strike, sl_distance, "PCR_RESISTANCE", confidence))
-            
-            # 3. Check GAMMA_RESISTANCE
-            if gamma_analysis and gamma_analysis.gex_resistance_levels:
-                for gamma_level in gamma_analysis.gex_resistance_levels:
-                    sl_distance = (gamma_level.strike - current_price) / current_price * 100
-                    if 0 < sl_distance <= max_distance_pct:
-                        confidence = gamma_level.strength * 0.8
-                        sl_candidates.append((gamma_level.strike, sl_distance, "GAMMA_RESISTANCE", confidence))
+            # For SHORT: SL above price (use resistance levels)
+            for level in resistance_levels:
+                distance_pct = level.get("distance_pct", 0)
+                if 0 < distance_pct <= max_distance_pct:
+                    level_type = level.get("type", "RESISTANCE")
+                    strength = level.get("strength", 0.5)
+                    sl_candidates.append((
+                        level["price"],
+                        distance_pct,
+                        level_type,
+                        strength,
+                    ))
         
-        # Select best SL candidate (highest confidence within max distance)
+        # Select best SL candidate (highest confidence/strength within max distance)
         if sl_candidates:
-            # Sort by confidence (highest first)
+            # Sort by confidence/strength (highest first)
             sl_candidates.sort(key=lambda x: x[3], reverse=True)
             best_sl = sl_candidates[0]
             
