@@ -813,8 +813,6 @@ class OptionsFetcher:
                 iv = 0.0
                 delta = 0.0
                 gamma = 0.0
-                theta = 0.0
-                vega = 0.0
                 
                 if mark:
                     # Convert IV from decimal to percentage (1.45 -> 145%)
@@ -826,14 +824,10 @@ class OptionsFetcher:
                     
                     delta_str = mark.get("delta", "0")
                     gamma_str = mark.get("gamma", "0")
-                    theta_str = mark.get("theta", "0")
-                    vega_str = mark.get("vega", "0")
                     
                     try:
                         delta = float(delta_str) if delta_str else 0.0
                         gamma = float(gamma_str) if gamma_str else 0.0
-                        theta = float(theta_str) if theta_str else 0.0
-                        vega = float(vega_str) if vega_str else 0.0
                     except (ValueError, TypeError):
                         pass
                 
@@ -852,12 +846,7 @@ class OptionsFetcher:
                     iv=iv,
                     delta=delta,
                     gamma=gamma,
-                    theta=theta,
-                    vega=vega,
                     last_price=last_price,
-                    bid=float(ticker.get("bid_price", 0) or 0),
-                    ask=float(ticker.get("ask_price", 0) or 0),
-                    change_24h=float(ticker.get("price_change_percent", 0) or 0),
                 )
                 
                 # Create strike entry if not exists

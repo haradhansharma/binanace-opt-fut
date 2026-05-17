@@ -21,7 +21,6 @@ from binance_signal_generator.models import (
     StrikeData,
     WhaleTrade,
     WhaleAnalysis,
-    WhaleDirection,
 )
 from binance_signal_generator.utils.logging import get_logger
 
@@ -222,8 +221,8 @@ class WhaleDetector:
                 strike=strike,
                 expiry=trade.get("expiry"),
                 premium=float(premium),
-                contracts=int(trade.get("quantity", trade.get("contracts", 0))),
-                price_per_contract=float(trade.get("price", 0)),
+                contracts=float(trade.get("quantity", trade.get("contracts", 0)) or 0),
+                price_per_contract=float(trade.get("price", 0) or 0),
                 direction=direction,
                 aggressor=trade.get("aggressor", "UNKNOWN"),
                 is_block_trade=is_block,
@@ -701,3 +700,97 @@ class WhaleDetector:
             "activity_score": round(analysis.whale_activity_score, 3),
             "confidence_boost": round(analysis.confidence_boost, 3),
         }
+    
+    def parse_block_trades_to_whale_trades(
+        self,
+        block_trades: List[Dict[str, Any]],
+        underlying: str,
+    ) -> List[WhaleTrade]:
+        """
+        Parse block trades into WhaleTrade objects for a specific underlying.
+        
+        This method is used to prepare trades for advanced volume analysis.
+        
+        Args:
+            block_trades: List of block trades from API (all symbols)
+            underlying: The underlying symbol to filter for (e.g., "BTCUSDT")
+            
+        Returns:
+            List of WhaleTrade objects for the specified underlying
+        """
+        # Extract base asset (BTCUSDT -> BTC)
+        base = underlying.replace("USDT", "").replace("BUSD", "")
+        
+        # Get asset-specific thresholds
+        min_premium, block_threshold = self._get_thresholds_for_asset(underlying)
+        
+        # Filter trades for this underlying
+        underlying_trades = [
+            t for t in block_trades
+            if t.get("symbol", "").startswith(f"{base}-")
+        ]
+        
+        if not underlying_trades:
+            return []
+        
+        # Parse each trade
+        whale_trades = []
+        for trade in underlying_trades:
+            # Handle timestamp
+            timestamp = trade.get("time", trade.get("timestamp"))
+            if isinstance(timestamp, (int, float)):
+                # Convert milliseconds to datetime
+                timestamp = datetime.utcfromtimestamp(timestamp / 1000)
+            elif not isinstance(timestamp, datetime):
+                timestamp = datetime.utcnow()
+            
+            # Get premium with multiple field name variations
+            premium = (
+                trade.get("quoteQty") or
+                trade.get("quote_qty") or
+                trade.get("amount") or
+                trade.get("premium") or
+                trade.get("value") or
+                0
+            )
+            premium = abs(float(premium) if premium else 0)
+            
+            # Determine option type from symbol
+            symbol = trade.get("symbol", "")
+            option_type = self._get_option_type(symbol)
+            
+            # Determine strike from symbol
+            strike = self._get_strike_from_symbol(symbol)
+            
+            # Determine trade direction (side is -1 for sell, 1 for buy)
+            side = trade.get("side", 0)
+            direction = "SELL" if side == -1 else "BUY" if side == 1 else "UNKNOWN"
+            
+            # Infer sentiment
+            sentiment = self._infer_sentiment(option_type, direction)
+            
+            # Determine if block trade
+            is_block = premium >= block_threshold
+            
+            whale_trade = WhaleTrade(
+                trade_id=str(trade.get("trade_id", trade.get("id", ""))),
+                timestamp=timestamp,
+                symbol=symbol,
+                option_type=option_type,
+                strike=strike,
+                expiry=None,
+                premium=premium,
+                contracts=float(trade.get("quantity", trade.get("qty", 0)) or 0),
+                price_per_contract=float(trade.get("price", 0) or 0),
+                direction=direction,
+                aggressor="UNKNOWN",
+                is_block_trade=is_block,
+                inferred_sentiment=sentiment,
+            )
+            whale_trades.append(whale_trade)
+        
+        logger.debug(
+            f"Parsed {len(whale_trades)} whale trades for {underlying}"
+        )
+        
+        return whale_trades

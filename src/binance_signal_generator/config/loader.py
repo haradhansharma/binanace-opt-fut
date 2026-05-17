@@ -11,7 +11,7 @@ Loads configuration from YAML files with support for:
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, Optional
 from dataclasses import dataclass, field
 
 import yaml

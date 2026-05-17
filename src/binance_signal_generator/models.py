@@ -22,27 +22,12 @@ class SignalDirection(Enum):
     NEUTRAL = "NEUTRAL"
 
 
-## finalizing before clean
 class SignalStrength(Enum):
     """Signal strength classification."""
     WEAK = "WEAK"
     MODERATE = "MODERATE"
     STRONG = "STRONG"
     VERY_STRONG = "VERY_STRONG"
-
-
-class WhaleDirection(Enum):
-    """Whale activity direction."""
-    BULLISH = "BULLISH"
-    BEARISH = "BEARISH"
-    NEUTRAL = "NEUTRAL"
-
-
-class WallType(Enum):
-    """Options wall type."""
-    CALL_WALL = "CALL_WALL"  # Resistance
-    PUT_WALL = "PUT_WALL"    # Support
-    MAX_PAIN = "MAX_PAIN"
 
 
 class ActivityDriver(Enum):
@@ -192,7 +177,7 @@ class WhaleTrade:
     strike: float
     expiry: Optional[datetime]
     premium: float  # $ value
-    contracts: int
+    contracts: float  # Can be fractional (e.g., 0.32 BTC)
     price_per_contract: float
     direction: str  # 'BUY' or 'SELL'
     aggressor: str

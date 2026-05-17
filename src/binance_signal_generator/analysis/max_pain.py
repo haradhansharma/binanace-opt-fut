@@ -15,7 +15,6 @@ Max Pain Theory:
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
-import math
 
 from binance_signal_generator.models import (
     OptionsChain,

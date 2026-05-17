@@ -37,20 +37,30 @@ logger = get_logger(__name__)
 @dataclass
 class SignalScorerConfig:
     """Configuration for signal scoring."""
-    # Weights for each signal type (total must equal 1.0)
-    # Adjusted to include gamma exposure
-    iv_weight: float = 0.18
-    pcr_weight: float = 0.22
-    oi_weight: float = 0.18
-    max_pain_weight: float = 0.12
-    sentiment_weight: float = 0.18  # Sentiment from L/S ratios + funding
-    gamma_weight: float = 0.12  # Gamma Exposure (GEX) signal
+    # Core weights for each signal type (total must equal 1.0)
+    # Adjusted to include advanced metrics
+    iv_weight: float = 0.15           # Reduced from 0.18
+    pcr_weight: float = 0.18          # Reduced from 0.22
+    oi_weight: float = 0.15           # Reduced from 0.18
+    max_pain_weight: float = 0.10     # Reduced from 0.12
+    sentiment_weight: float = 0.15    # Reduced from 0.18
+    gamma_weight: float = 0.10        # Reduced from 0.12
+    
+    # Advanced metrics weights (NEW - Section 6.5 implementation)
+    oi_flow_weight: float = 0.05      # OI flow direction (BUILDING/UNWINDING)
+    wall_concentration_weight: float = 0.04   # Wall concentration from whale analysis
+    pcr_strike_alignment_weight: float = 0.03  # PCR strike alignment
+    whale_flow_weight: float = 0.05   # Whale money flow analysis
     
     # Minimum confidence for valid signal
     min_confidence: float = 0.4
     
     # Agreement threshold
     agreement_threshold: float = 0.6  # % of signals agreeing
+    
+    # IV value thresholds for crypto (Section 6.5 Priority 2)
+    iv_high_value: float = 0.80       # 80% annualized = HIGH
+    iv_low_value: float = 0.40        # 40% annualized = LOW
 
 
 class SignalScorer:
@@ -116,6 +126,9 @@ class SignalScorer:
         chain: OptionsChain,
         sentiment_analysis: Optional[SentimentAnalysis] = None,
         gamma_analysis: Optional[GammaAnalysis] = None,
+        advanced_metrics: Optional[Dict[str, Any]] = None,
+        whale_volume_analysis: Optional[Dict[str, Any]] = None,
+        wall_analysis: Optional[Any] = None,
     ) -> OptionsSignal:
         """
         Perform complete analysis and generate combined signal.
@@ -124,6 +137,9 @@ class SignalScorer:
             chain: Options chain data
             sentiment_analysis: Optional sentiment analysis from L/S ratios
             gamma_analysis: Optional gamma exposure analysis for dealer hedging
+            advanced_metrics: Optional dict with pcr_by_strike, oi_distribution, oi_flow, etc.
+            whale_volume_analysis: Optional whale volume analysis from WhaleVolumeAnalyzer
+            wall_analysis: Optional wall analysis from WallDetector
             
         Returns:
             OptionsSignal with combined analysis
@@ -137,18 +153,26 @@ class SignalScorer:
         # Derive gamma signal if analysis provided
         gamma_signal, gamma_confidence = self._derive_gamma_signal(gamma_analysis, chain.spot_price)
         
+        # Derive advanced metric signals (NEW - Section 6.5 implementation)
+        oi_flow_signal, oi_flow_confidence = self._derive_oi_flow_signal(advanced_metrics)
+        wall_conc_signal, wall_conc_confidence = self._derive_wall_concentration_signal(wall_analysis, whale_volume_analysis)
+        pcr_strike_signal, pcr_strike_confidence = self._derive_pcr_strike_signal(advanced_metrics, chain.spot_price)
+        whale_flow_signal, whale_flow_confidence = self._derive_whale_flow_signal(whale_volume_analysis)
+        
         # Debug logging
         sentiment_str = ""
         if sentiment_analysis:
             sentiment_str = f", Sentiment={sentiment_analysis.signal.value}({sentiment_analysis.signal_confidence:.2f})"
         gamma_str = f", Gamma={gamma_signal.value}({gamma_confidence:.2f})" if gamma_analysis else ""
+        oi_flow_str = f", OIFlow={oi_flow_signal.value}({oi_flow_confidence:.2f})"
+        whale_str = f", Whale={whale_flow_signal.value}({whale_flow_confidence:.2f})"
         logger.debug(
             f"Signal components for {chain.underlying}: "
             f"IV={iv_analysis.signal.value}({iv_analysis.confidence:.2f}), "
             f"PCR={pcr_analysis.signal.value}({pcr_analysis.confidence:.2f}), "
             f"OI={oi_analysis.signal.value}({oi_analysis.confidence:.2f}), "
             f"MaxPain={max_pain_analysis.signal.value}({max_pain_analysis.confidence:.2f})"
-            f"{sentiment_str}{gamma_str}"
+            f"{sentiment_str}{gamma_str}{oi_flow_str}{whale_str}"
         )
         
         # Combine signals
@@ -160,6 +184,14 @@ class SignalScorer:
             sentiment_analysis=sentiment_analysis,
             gamma_signal=gamma_signal,
             gamma_confidence=gamma_confidence,
+            oi_flow_signal=oi_flow_signal,
+            oi_flow_confidence=oi_flow_confidence,
+            wall_conc_signal=wall_conc_signal,
+            wall_conc_confidence=wall_conc_confidence,
+            pcr_strike_signal=pcr_strike_signal,
+            pcr_strike_confidence=pcr_strike_confidence,
+            whale_flow_signal=whale_flow_signal,
+            whale_flow_confidence=whale_flow_confidence,
         )
         
         return OptionsSignal(
@@ -272,6 +304,213 @@ class SignalScorer:
         
         return signal, round(confidence, 3)
     
+    def _derive_oi_flow_signal(
+        self,
+        advanced_metrics: Optional[Dict[str, Any]],
+    ) -> tuple:
+        """
+        Derive trading signal from OI flow analysis.
+        
+        OI Flow Signal Logic (Section 6.5 Priority 1):
+        - BUILDING: OI is increasing → positions being built → follow the flow
+          BUILDING + price rising = LONG bias (new long positions)
+          BUILDING + price falling = SHORT bias (new short positions)
+        - UNWINDING: OI is decreasing → positions being closed → reversal potential
+          UNWINDING + price rising = SHORT bias (shorts covering)
+          UNWINDING + price falling = LONG bias (longs liquidating)
+        - STABLE: No clear signal
+        
+        Args:
+            advanced_metrics: Dict with oi_flow data
+            
+        Returns:
+            Tuple of (SignalDirection, confidence)
+        """
+        if not advanced_metrics:
+            return SignalDirection.NEUTRAL, 0.0
+        
+        oi_flow = advanced_metrics.get("oi_flow")
+        if not oi_flow:
+            return SignalDirection.NEUTRAL, 0.0
+        
+        flow_direction = oi_flow.get("flow_direction", "STABLE")
+        oi_change = oi_flow.get("oi_change_estimated", 0.0)
+        
+        # Convert OI flow to signal
+        if flow_direction == "BUILDING":
+            # OI increasing suggests conviction in current direction
+            # For now, assume price is rising (would need price data for full logic)
+            # Use OI change magnitude for confidence
+            signal = SignalDirection.LONG  # Default: building = bullish
+            confidence = min(abs(oi_change) / 20.0, 0.8)  # 20% change = max confidence
+        elif flow_direction == "UNWINDING":
+            # OI decreasing suggests position closure
+            signal = SignalDirection.SHORT  # Default: unwinding = bearish
+            confidence = min(abs(oi_change) / 20.0, 0.8)
+        else:
+            signal = SignalDirection.NEUTRAL
+            confidence = 0.0
+        
+        return signal, round(confidence, 3)
+    
+    def _derive_wall_concentration_signal(
+        self,
+        wall_analysis: Optional[Any],
+        whale_volume_analysis: Optional[Dict[str, Any]],
+    ) -> tuple:
+        """
+        Derive trading signal from wall concentration analysis.
+        
+        Wall Concentration Signal Logic (Section 6.5 Priority 1):
+        - High wall imbalance (put walls > call walls) = Support at lower strikes = LONG bias
+        - High wall imbalance (call walls > put walls) = Resistance above = SHORT bias
+        - Concentrated whale activity at specific strikes = directional conviction
+        
+        Args:
+            wall_analysis: Wall detection analysis
+            whale_volume_analysis: Whale volume analysis
+            
+        Returns:
+            Tuple of (SignalDirection, confidence)
+        """
+        signal = SignalDirection.NEUTRAL
+        confidence = 0.0
+        
+        # Check wall imbalance
+        if wall_analysis and hasattr(wall_analysis, 'wall_imbalance'):
+            imbalance = wall_analysis.wall_imbalance
+            
+            # wall_imbalance > 0 = more put walls (support) = LONG bias
+            # wall_imbalance < 0 = more call walls (resistance) = SHORT bias
+            if imbalance > 0.3:
+                signal = SignalDirection.LONG
+                confidence = min(imbalance, 0.7)
+            elif imbalance < -0.3:
+                signal = SignalDirection.SHORT
+                confidence = min(abs(imbalance), 0.7)
+        
+        # Boost confidence if whale concentration aligns
+        if whale_volume_analysis:
+            concentration = whale_volume_analysis.get("concentration", {})
+            is_concentrated = concentration.get("is_concentrated", False)
+            if is_concentrated and confidence > 0:
+                confidence = min(confidence * 1.3, 0.85)  # Boost by 30%
+        
+        return signal, round(confidence, 3)
+    
+    def _derive_pcr_strike_signal(
+        self,
+        advanced_metrics: Optional[Dict[str, Any]],
+        spot_price: float,
+    ) -> tuple:
+        """
+        Derive trading signal from PCR by strike alignment.
+        
+        PCR Strike Alignment Logic (Section 6.5 Priority 1):
+        - Put-heavy strikes near spot = potential support = LONG bias
+        - Call-heavy strikes near spot = potential resistance = SHORT bias
+        - Alignment with signal direction boosts confidence
+        
+        Args:
+            advanced_metrics: Dict with pcr_by_strike data
+            spot_price: Current spot price
+            
+        Returns:
+            Tuple of (SignalDirection, confidence)
+        """
+        if not advanced_metrics or not spot_price:
+            return SignalDirection.NEUTRAL, 0.0
+        
+        pcr_by_strike = advanced_metrics.get("pcr_by_strike")
+        if not pcr_by_strike:
+            return SignalDirection.NEUTRAL, 0.0
+        
+        put_heavy_count = pcr_by_strike.get("put_heavy_count", 0)
+        call_heavy_count = pcr_by_strike.get("call_heavy_count", 0)
+        
+        # Determine signal based on which strikes dominate
+        if put_heavy_count > call_heavy_count * 1.5:
+            # More put-heavy strikes = potential support = LONG bias
+            signal = SignalDirection.LONG
+            confidence = min((put_heavy_count - call_heavy_count) * 0.15, 0.6)
+        elif call_heavy_count > put_heavy_count * 1.5:
+            # More call-heavy strikes = potential resistance = SHORT bias
+            signal = SignalDirection.SHORT
+            confidence = min((call_heavy_count - put_heavy_count) * 0.15, 0.6)
+        else:
+            signal = SignalDirection.NEUTRAL
+            confidence = 0.0
+        
+        return signal, round(confidence, 3)
+    
+    def _derive_whale_flow_signal(
+        self,
+        whale_volume_analysis: Optional[Dict[str, Any]],
+    ) -> tuple:
+        """
+        Derive trading signal from whale money flow analysis.
+        
+        Whale Flow Signal Logic (Section 6.5 Priority 1):
+        - Net positive call flow = whales buying calls = BULLISH
+        - Net positive put flow = whales buying puts = BEARISH
+        - Aggressive buyers/sellers indicate conviction
+        - Time pattern (INCREASING_BUYING/SELLING) indicates momentum
+        
+        Args:
+            whale_volume_analysis: Whale volume analysis from WhaleVolumeAnalyzer
+            
+        Returns:
+            Tuple of (SignalDirection, confidence)
+        """
+        if not whale_volume_analysis:
+            return SignalDirection.NEUTRAL, 0.0
+        
+        summary = whale_volume_analysis.get("summary", {})
+        flow = whale_volume_analysis.get("flow", {})
+        
+        # Extract key metrics
+        overall_sentiment = summary.get("overall_sentiment", "NEUTRAL")
+        time_pattern = summary.get("time_pattern", "UNKNOWN")
+        aggressive_side = summary.get("aggressive_side", "UNKNOWN")
+        
+        call_flow_net = flow.get("call_flow", {}).get("net", 0)
+        put_flow_net = flow.get("put_flow", {}).get("net", 0)
+        
+        # Determine signal
+        signal = SignalDirection.NEUTRAL
+        confidence = 0.0
+        
+        if overall_sentiment == "BULLISH":
+            signal = SignalDirection.LONG
+            # Base confidence from sentiment
+            confidence = 0.5
+            
+            # Boost if increasing buying pattern
+            if time_pattern in ["INCREASING_BUYING", "CONSISTENT_BUYING"]:
+                confidence += 0.2
+            
+            # Boost if buyers are aggressive
+            if aggressive_side == "BUYERS":
+                confidence += 0.1
+                
+        elif overall_sentiment == "BEARISH":
+            signal = SignalDirection.SHORT
+            confidence = 0.5
+            
+            if time_pattern in ["INCREASING_SELLING", "CONSISTENT_SELLING"]:
+                confidence += 0.2
+            
+            if aggressive_side == "SELLERS":
+                confidence += 0.1
+        
+        # Scale confidence by flow magnitude (if available)
+        total_flow = abs(call_flow_net) + abs(put_flow_net)
+        if total_flow > 0:
+            flow_ratio = (abs(call_flow_net) - abs(put_flow_net)) / total_flow
+            confidence = confidence * (1 + abs(flow_ratio) * 0.3)
+        
+        return signal, round(min(confidence, 0.85), 3)
+    
     def _combine_signals(
         self,
         iv_analysis: IVAnalysis,
@@ -281,6 +520,14 @@ class SignalScorer:
         sentiment_analysis: Optional[SentimentAnalysis] = None,
         gamma_signal: SignalDirection = SignalDirection.NEUTRAL,
         gamma_confidence: float = 0.0,
+        oi_flow_signal: SignalDirection = SignalDirection.NEUTRAL,
+        oi_flow_confidence: float = 0.0,
+        wall_conc_signal: SignalDirection = SignalDirection.NEUTRAL,
+        wall_conc_confidence: float = 0.0,
+        pcr_strike_signal: SignalDirection = SignalDirection.NEUTRAL,
+        pcr_strike_confidence: float = 0.0,
+        whale_flow_signal: SignalDirection = SignalDirection.NEUTRAL,
+        whale_flow_confidence: float = 0.0,
     ) -> tuple:
         """
         Combine multiple signals into one.
@@ -293,6 +540,14 @@ class SignalScorer:
             sentiment_analysis: Optional sentiment analysis from L/S ratios
             gamma_signal: Signal derived from gamma exposure
             gamma_confidence: Confidence of gamma signal
+            oi_flow_signal: Signal from OI flow analysis (NEW)
+            oi_flow_confidence: Confidence of OI flow signal
+            wall_conc_signal: Signal from wall concentration (NEW)
+            wall_conc_confidence: Confidence of wall concentration signal
+            pcr_strike_signal: Signal from PCR strike alignment (NEW)
+            pcr_strike_confidence: Confidence of PCR strike signal
+            whale_flow_signal: Signal from whale money flow (NEW)
+            whale_flow_confidence: Confidence of whale flow signal
             
         Returns:
             Tuple of (SignalDirection, confidence, raw_score)
@@ -318,7 +573,13 @@ class SignalScorer:
         # Add gamma signal
         signals["gamma"] = self._signal_to_numeric(gamma_signal) * gamma_confidence
         
-        # Apply weights
+        # Add advanced metric signals (NEW - Section 6.5 implementation)
+        signals["oi_flow"] = self._signal_to_numeric(oi_flow_signal) * oi_flow_confidence
+        signals["wall_conc"] = self._signal_to_numeric(wall_conc_signal) * wall_conc_confidence
+        signals["pcr_strike"] = self._signal_to_numeric(pcr_strike_signal) * pcr_strike_confidence
+        signals["whale_flow"] = self._signal_to_numeric(whale_flow_signal) * whale_flow_confidence
+        
+        # Apply weights (core + advanced)
         weighted_signals = {
             "iv": signals["iv"] * self.config.iv_weight,
             "pcr": signals["pcr"] * self.config.pcr_weight,
@@ -326,12 +587,17 @@ class SignalScorer:
             "max_pain": signals["max_pain"] * self.config.max_pain_weight,
             "sentiment": signals["sentiment"] * self.config.sentiment_weight,
             "gamma": signals["gamma"] * self.config.gamma_weight,
+            # Advanced metrics weights (NEW)
+            "oi_flow": signals["oi_flow"] * self.config.oi_flow_weight,
+            "wall_conc": signals["wall_conc"] * self.config.wall_concentration_weight,
+            "pcr_strike": signals["pcr_strike"] * self.config.pcr_strike_alignment_weight,
+            "whale_flow": signals["whale_flow"] * self.config.whale_flow_weight,
         }
         
         # Calculate raw score
         raw_score = sum(weighted_signals.values())
         
-        # Calculate agreement (include all signals)
+        # Calculate agreement (include all signals including advanced)
         signal_list = [
             iv_analysis.signal,
             pcr_analysis.signal,
@@ -342,6 +608,16 @@ class SignalScorer:
             signal_list.append(sentiment_analysis.signal)
         if gamma_signal != SignalDirection.NEUTRAL:
             signal_list.append(gamma_signal)
+        # Add advanced signals to agreement calculation
+        if oi_flow_signal != SignalDirection.NEUTRAL:
+            signal_list.append(oi_flow_signal)
+        if wall_conc_signal != SignalDirection.NEUTRAL:
+            signal_list.append(wall_conc_signal)
+        if pcr_strike_signal != SignalDirection.NEUTRAL:
+            signal_list.append(pcr_strike_signal)
+        if whale_flow_signal != SignalDirection.NEUTRAL:
+            signal_list.append(whale_flow_signal)
+        
         agreement = self._calculate_agreement(*signal_list)
         
         # Determine direction
@@ -352,11 +628,11 @@ class SignalScorer:
         else:
             direction = SignalDirection.NEUTRAL
         
-        # Calculate confidence
+        # Calculate confidence (Section 6.6 formula with enhancements)
         # Base confidence from signal strength
         base_confidence = min(abs(raw_score) * 2, 1.0)
         
-        # Adjust by agreement
+        # Adjust by agreement (more agreement = higher confidence)
         confidence = base_confidence * (0.5 + 0.5 * agreement)
         
         return direction, round(confidence, 3), round(raw_score, 3)

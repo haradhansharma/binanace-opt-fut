@@ -3,18 +3,22 @@ Logging configuration for the Binance Signal Generator.
 
 This module provides a centralized logging configuration that supports:
 - JSON structured logging
-- File and console handlers
+- File and console handlers with rotation
 - Sensitive data masking
 - Configurable log levels
+- Full LoggingConfig integration
 """
 
 import logging
 import sys
 import json
 from datetime import datetime
-from typing import Optional, Dict, Any, Set
+from typing import Optional, Dict, Any, Set, TYPE_CHECKING
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
+
+if TYPE_CHECKING:
+    from binance_signal_generator.config.loader import LoggingConfig
 
 
 # Sensitive keys to mask in logs
@@ -76,6 +80,16 @@ class JSONFormatter(logging.Formatter):
     }
     """
     
+    def __init__(self, mask_sensitive_data: bool = True):
+        """
+        Initialize JSON formatter.
+        
+        Args:
+            mask_sensitive_data: Whether to mask sensitive data
+        """
+        super().__init__()
+        self.mask_sensitive_data = mask_sensitive_data
+    
     def format(self, record: logging.LogRecord) -> str:
         log_data = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -86,7 +100,10 @@ class JSONFormatter(logging.Formatter):
         
         # Add extra fields if present
         if hasattr(record, "data") and record.data:
-            log_data["data"] = mask_sensitive(record.data)
+            if self.mask_sensitive_data:
+                log_data["data"] = mask_sensitive(record.data)
+            else:
+                log_data["data"] = record.data
         
         # Add exception info if present
         if record.exc_info:
@@ -110,12 +127,45 @@ class StandardFormatter(logging.Formatter):
     Format: [TIMESTAMP] LEVEL - LOGGER - MESSAGE
     """
     
+    def __init__(self, mask_sensitive_data: bool = True, colorize: bool = False):
+        """
+        Initialize standard formatter.
+        
+        Args:
+            mask_sensitive_data: Whether to mask sensitive data
+            colorize: Whether to colorize output with ANSI codes
+        """
+        super().__init__()
+        self.mask_sensitive_data = mask_sensitive_data
+        self.colorize = colorize
+        
+        # ANSI color codes
+        self.COLORS = {
+            "DEBUG": "\033[36m",     # Cyan
+            "INFO": "\033[32m",      # Green
+            "WARNING": "\033[33m",   # Yellow
+            "ERROR": "\033[31m",     # Red
+            "CRITICAL": "\033[35m",  # Magenta
+            "RESET": "\033[0m",      # Reset
+        }
+    
     def format(self, record: logging.LogRecord) -> str:
         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        base = f"[{timestamp}] {record.levelname:8s} - {record.name} - {record.getMessage()}"
+        
+        # Colorize level if enabled
+        level = record.levelname
+        if self.colorize:
+            level = f"{self.COLORS.get(record.levelname, '')}{record.levelname:8s}{self.COLORS['RESET']}"
+        else:
+            level = f"{record.levelname:8s}"
+        
+        base = f"[{timestamp}] {level} - {record.name} - {record.getMessage()}"
         
         if hasattr(record, "data") and record.data:
-            masked_data = mask_sensitive(record.data)
+            if self.mask_sensitive_data:
+                masked_data = mask_sensitive(record.data)
+            else:
+                masked_data = record.data
             base += f" | {json.dumps(masked_data)}"
         
         if record.exc_info:
@@ -132,6 +182,7 @@ def setup_logging(
     console_enabled: bool = False,
     json_format: bool = True,
     mask_sensitive_data: bool = True,
+    console_colorize: bool = False,
 ) -> logging.Logger:
     """
     Set up logging configuration for the signal generator.
@@ -144,6 +195,7 @@ def setup_logging(
         console_enabled: Whether to output to console
         json_format: Whether to use JSON format (True) or text format (False)
         mask_sensitive_data: Whether to mask sensitive data in logs
+        console_colorize: Whether to colorize console output
         
     Returns:
         Configured logger for the signal generator package
@@ -160,9 +212,12 @@ def setup_logging(
     
     # Choose formatter
     if json_format:
-        formatter = JSONFormatter()
+        formatter = JSONFormatter(mask_sensitive_data=mask_sensitive_data)
     else:
-        formatter = StandardFormatter()
+        formatter = StandardFormatter(
+            mask_sensitive_data=mask_sensitive_data,
+            colorize=console_colorize
+        )
     
     # File handler (always enabled if path provided)
     if log_file:
@@ -182,14 +237,43 @@ def setup_logging(
     if console_enabled:
         console_handler = logging.StreamHandler(sys.stderr)
         console_handler.setLevel(log_level)
-        # Console always uses standard format for readability
-        console_handler.setFormatter(StandardFormatter())
+        # Console uses standard format with optional colorization
+        console_formatter = StandardFormatter(
+            mask_sensitive_data=mask_sensitive_data,
+            colorize=console_colorize
+        )
+        console_handler.setFormatter(console_formatter)
         logger.addHandler(console_handler)
     
     # Prevent propagation to root logger
     logger.propagate = False
     
     return logger
+
+
+def setup_logging_from_config(config: "LoggingConfig") -> logging.Logger:
+    """
+    Set up logging from LoggingConfig object.
+    
+    This is the preferred way to initialize logging when using
+    the configuration system.
+    
+    Args:
+        config: LoggingConfig object with all settings
+        
+    Returns:
+        Configured logger for the signal generator package
+    """
+    return setup_logging(
+        level=config.level,
+        log_file=config.file_path if config.file_enabled else None,
+        max_size_mb=config.file_max_size_mb,
+        backup_count=config.file_backup_count,
+        console_enabled=config.console_enabled,
+        json_format=(config.format == "json"),
+        mask_sensitive_data=config.mask_sensitive,
+        console_colorize=config.console_colorize,
+    )
 
 
 def get_logger(name: str) -> logging.Logger:

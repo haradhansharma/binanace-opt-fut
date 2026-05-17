@@ -26,7 +26,6 @@ import asyncio
 import json
 import sys
 from datetime import datetime
-from pathlib import Path
 from typing import Optional, List
 
 from binance_signal_generator import __version__

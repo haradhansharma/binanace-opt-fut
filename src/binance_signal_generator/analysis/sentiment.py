@@ -298,18 +298,20 @@ class SentimentAnalyzer:
         - Positive funding: Longs pay shorts = overcrowded longs
         - Negative funding: Shorts pay longs = overcrowded shorts
         - Extreme funding: Potential reversal indicator
+        - Funding momentum: Rising/falling funding indicates trend strength
         
         Args:
             data: List of funding rate data points
             
         Returns:
-            Dictionary with current rate, avg, extreme flag, and score
+            Dictionary with current rate, avg, extreme flag, momentum, and score
         """
         if not data:
             return {
                 "current_rate": 0.0,
                 "avg_rate": 0.0,
                 "is_extreme": False,
+                "momentum": "NEUTRAL",
                 "score": 0.0,
             }
         
@@ -327,6 +329,24 @@ class SentimentAnalyzer:
             current_rate > self.config.funding_extreme_high or
             current_rate < self.config.funding_extreme_low
         )
+        
+        # Calculate funding rate momentum (NEW - Section 6.5 Priority 3)
+        # Momentum indicates whether funding is trending higher or lower
+        momentum = "NEUTRAL"
+        momentum_score = 0.0
+        if len(recent_data) >= 4:
+            # Compare recent (last 2) vs older (first 2)
+            recent_avg = sum(d.funding_rate for d in recent_data[-2:]) / 2
+            older_avg = sum(d.funding_rate for d in recent_data[:2]) / 2
+            
+            momentum_change = recent_avg - older_avg
+            
+            if momentum_change > 0.0002:  # Rising funding
+                momentum = "RISING"
+                momentum_score = min(momentum_change / 0.0005, 0.3)
+            elif momentum_change < -0.0002:  # Falling funding
+                momentum = "FALLING"
+                momentum_score = min(abs(momentum_change) / 0.0005, 0.3)
         
         # Calculate score
         # Note: High positive funding = bearish contrarian signal
@@ -346,10 +366,19 @@ class SentimentAnalyzer:
         else:
             score = 0.0
         
+        # Adjust score by momentum (NEW)
+        # Rising funding with positive rate = more crowded = stronger contrarian signal
+        # Falling funding with negative rate = less crowded = weaker signal
+        if momentum == "RISING" and current_rate > 0:
+            score += momentum_score  # Amplify bullish sentiment (contrarian becomes more bearish)
+        elif momentum == "FALLING" and current_rate < 0:
+            score -= momentum_score  # Amplify bearish sentiment
+        
         return {
             "current_rate": current_rate,
             "avg_rate": avg_rate,
             "is_extreme": is_extreme,
+            "momentum": momentum,
             "score": round(score, 3),
         }
     

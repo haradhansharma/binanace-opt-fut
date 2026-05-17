@@ -267,10 +267,14 @@ class IVAnalyzer:
         """
         Generate trading signal from IV analysis.
         
-        Signal Logic:
-        - High IV + Positive Skew = Bearish (panic pricing)
-        - Low IV + Negative Skew = Bullish (complacency)
+        Signal Logic (Enhanced for crypto - Section 6.5 Priority 2):
+        - High IV (>0.80 value or >75th percentile) + Positive Skew = Bearish (panic pricing)
+        - Low IV (<0.40 value or <25th percentile) + Negative Skew = Bullish (complacency)
         - Normal IV = Neutral
+        
+        For crypto, we use BOTH value-based and percentile-based thresholds:
+        - Value-based: More absolute, good for comparing across assets
+        - Percentile-based: Better for relative positioning
         
         Args:
             iv_percentile: IV percentile
@@ -280,29 +284,50 @@ class IVAnalyzer:
         Returns:
             Tuple of (SignalDirection, confidence)
         """
+        # Use value-based thresholds for crypto (more reliable)
+        # These are configurable in IVConfig
+        iv_high_value = self.config.iv_high_value  # Default 0.80 (80% annualized)
+        iv_low_value = self.config.iv_low_value     # Default 0.40 (40% annualized)
+        
+        # Determine IV state using BOTH value and percentile
+        is_high_iv = atm_iv >= iv_high_value or iv_percentile >= self.config.iv_high_threshold
+        is_low_iv = atm_iv <= iv_low_value or iv_percentile <= self.config.iv_low_threshold
+        
         # High IV regime
-        if iv_percentile >= self.config.iv_high_threshold:
+        if is_high_iv:
             # Positive skew confirms bearish sentiment
             if iv_skew > 0.05:
                 return SignalDirection.SHORT, 0.7
             elif iv_skew > 0:
                 return SignalDirection.SHORT, 0.5
             else:
-                # High IV but no skew = neutral
+                # High IV but no skew = neutral (less bearish signal)
+                # For crypto, high IV without skew still indicates potential volatility
+                # Could be a neutral or slight short bias
                 return SignalDirection.NEUTRAL, 0.3
         
         # Low IV regime
-        elif iv_percentile <= self.config.iv_low_threshold:
+        elif is_low_iv:
             # Negative skew suggests bullish bias
             if iv_skew < -0.05:
                 return SignalDirection.LONG, 0.6
             elif iv_skew < 0:
                 return SignalDirection.LONG, 0.4
             else:
-                return SignalDirection.NEUTRAL, 0.3
+                # Low IV without skew - still potentially bullish for crypto
+                # Low IV periods often precede price moves
+                return SignalDirection.LONG, 0.35
         
-        # Normal IV regime
+        # Normal IV regime - use value proximity for gradient signals
         else:
+            # If IV is trending toward high/low, provide weak signals
+            if atm_iv > (iv_high_value * 0.9):  # Approaching high
+                if iv_skew > 0:
+                    return SignalDirection.SHORT, 0.25
+            elif atm_iv < (iv_low_value * 1.1):  # Approaching low
+                if iv_skew < 0:
+                    return SignalDirection.LONG, 0.25
+            
             return SignalDirection.NEUTRAL, 0.2
     
     def _create_empty_analysis(self, symbol: str) -> IVAnalysis:

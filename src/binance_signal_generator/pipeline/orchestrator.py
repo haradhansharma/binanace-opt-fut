@@ -16,7 +16,7 @@ import asyncio
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 from binance_signal_generator.config.loader import Config
 from binance_signal_generator.data.options_fetcher import OptionsFetcher
@@ -25,9 +25,14 @@ from binance_signal_generator.ranking.activity_scorer import ActivityScorer
 from binance_signal_generator.ranking.asset_selector import AssetSelector, SelectionConfig
 from binance_signal_generator.analysis.signal_scorer import SignalScorer
 from binance_signal_generator.whale.whale_detector import WhaleDetector, WhaleDetectorConfig
+from binance_signal_generator.whale.volume_analyzer import WhaleVolumeAnalyzer, VolumeAnalyzerConfig
 from binance_signal_generator.analysis.wall_detector import WallDetector, WallDetectorConfig
 from binance_signal_generator.analysis.gamma_exposure import GammaExposureCalculator, GammaExposureConfig
 from binance_signal_generator.analysis.sentiment import SentimentAnalyzer, SentimentConfig
+from binance_signal_generator.analysis.iv_analyzer import IVAnalyzer, IVConfig
+from binance_signal_generator.analysis.pcr_analyzer import PCRAnalyzer, PCRConfig
+from binance_signal_generator.analysis.oi_analyzer import OIAnalyzer, OIConfig
+from binance_signal_generator.analysis.max_pain import MaxPainCalculator, MaxPainConfig
 from binance_signal_generator.output.sr_levels import SRLevelCalculator, SRLevelConfig
 from binance_signal_generator.models import (
     OptionsChain,
@@ -148,6 +153,9 @@ class PipelineOrchestrator:
         )
         self.whale_detector = WhaleDetector(whale_config)
         
+        # Initialize whale volume analyzer for advanced analysis
+        self.whale_volume_analyzer = WhaleVolumeAnalyzer(VolumeAnalyzerConfig())
+        
         # Initialize wall detector
         self.wall_detector = WallDetector(WallDetectorConfig())
         self.sr_calculator = SRLevelCalculator(SRLevelConfig())
@@ -157,6 +165,12 @@ class PipelineOrchestrator:
         
         # Initialize sentiment analyzer for L/S ratios and funding rates
         self.sentiment_analyzer = SentimentAnalyzer(SentimentConfig())
+        
+        # Initialize advanced analysis modules for detailed metrics
+        self.iv_analyzer = IVAnalyzer(IVConfig())
+        self.pcr_analyzer = PCRAnalyzer(PCRConfig())
+        self.oi_analyzer = OIAnalyzer(OIConfig())
+        self.max_pain_calculator = MaxPainCalculator(MaxPainConfig())
         
         # Execution tracking
         self._api_calls_made = 0
@@ -511,6 +525,23 @@ class PipelineOrchestrator:
             # Run whale detection using block trades
             whale_analysis = self.whale_detector.analyze_block_trades(block_trades, options_chain)
             
+            # Parse block trades into WhaleTrade objects for advanced volume analysis
+            whale_trades = self.whale_detector.parse_block_trades_to_whale_trades(
+                block_trades, symbol
+            )
+            
+            # Run advanced whale volume analysis
+            whale_volume_analysis = self.whale_volume_analyzer.analyze(
+                whale_trades, whale_analysis
+            )
+            
+            logger.debug(
+                f"Whale volume analysis for {symbol}: "
+                f"pattern={whale_volume_analysis.get('time_pattern', {}).get('pattern', 'N/A')}, "
+                f"sentiment={whale_volume_analysis.get('summary', {}).get('overall_sentiment', 'N/A')}, "
+                f"trades={len(whale_trades)}"
+            )
+            
             # Run wall detection
             wall_analysis = self.wall_detector.detect(options_chain)
             
@@ -540,11 +571,60 @@ class PipelineOrchestrator:
                 f"contrarian={sentiment_analysis.is_contrarian_signal}"
             )
             
-            # Run Options analysis with sentiment and gamma exposure
+            # Run advanced analysis methods for detailed metrics FIRST
+            # These are now used in signal scoring (Section 6.5 implementation)
+            
+            # 1. IV Term Structure (requires multiple chains - skipped for single chain)
+            # Note: IV Term Structure requires fetching multiple expiry chains
+            # This would require API changes to fetch multiple expiries
+            
+            # 2. PCR by Strike Analysis
+            pcr_by_strike = self.pcr_analyzer.analyze_pcr_by_strike(options_chain)
+            
+            # 3. OI Distribution Analysis
+            oi_distribution = self.oi_analyzer.get_oi_distribution(options_chain)
+            
+            # 4. Max Pain Distribution
+            pain_distribution = self.max_pain_calculator.get_pain_distribution(options_chain)
+            
+            # 5. Wall to S/R Conversion (already done via wall_analysis.support_levels/resistance_levels)
+            wall_sr_levels = self.wall_detector.get_sr_from_walls(wall_analysis) if wall_analysis else ([], [])
+            
+            # 6. OI Flow Analysis (requires historical data - use futures data)
+            oi_flow = None
+            if futures_data and futures_data.open_interest > 0:
+                oi_change_pct = futures_data.open_interest_change_pct if hasattr(futures_data, 'open_interest_change_pct') else 0.0
+                oi_flow = {
+                    "current_oi": futures_data.open_interest,
+                    "oi_change_estimated": oi_change_pct,
+                    "flow_direction": "BUILDING" if oi_change_pct > 5 else "UNWINDING" if oi_change_pct < -5 else "STABLE",
+                }
+            
+            # Create advanced_metrics dict for signal scoring
+            advanced_metrics = {
+                "pcr_by_strike": pcr_by_strike,
+                "oi_distribution": oi_distribution,
+                "pain_distribution": pain_distribution,
+                "oi_flow": oi_flow,
+            }
+            
+            # Run Options analysis with sentiment, gamma exposure, and advanced metrics
             options_signal = self.signal_scorer.analyze(
                 options_chain, 
                 sentiment_analysis,
                 gamma_analysis,
+                advanced_metrics=advanced_metrics,
+                whale_volume_analysis=whale_volume_analysis,
+                wall_analysis=wall_analysis,
+            )
+            
+            # Debug: Log advanced analysis results
+            logger.debug(
+                f"Advanced analysis for {symbol}: "
+                f"pcr_strikes={pcr_by_strike.get('put_heavy_count', 0)} put-heavy, "
+                f"{pcr_by_strike.get('call_heavy_count', 0)} call-heavy, "
+                f"oi_total={oi_distribution.get('total_oi', 0)}, "
+                f"pain_max={pain_distribution.get('max_pain_strike', 0):.0f}"
             )
             
             # Debug: Log analysis results
@@ -566,9 +646,15 @@ class PipelineOrchestrator:
                     options_chain=options_chain,
                     futures_data=futures_data,
                     whale_analysis=whale_analysis,
+                    whale_volume_analysis=whale_volume_analysis,
                     wall_analysis=wall_analysis,
                     gamma_analysis=gamma_analysis,
                     sentiment_analysis=sentiment_analysis,
+                    pcr_by_strike=pcr_by_strike,
+                    oi_distribution=oi_distribution,
+                    pain_distribution=pain_distribution,
+                    oi_flow=oi_flow,
+                    wall_sr_levels=wall_sr_levels,
                 )
             else:
                 logger.debug(f"Signal confidence {options_signal.confidence:.3f} below threshold {self.pipeline_config.min_signal_confidence}")
@@ -586,9 +672,15 @@ class PipelineOrchestrator:
         options_chain: OptionsChain,
         futures_data: FuturesData,
         whale_analysis: Optional[Any] = None,
+        whale_volume_analysis: Optional[Dict[str, Any]] = None,
         wall_analysis: Optional[Any] = None,
         gamma_analysis: Optional[Any] = None,
         sentiment_analysis: Optional[Any] = None,
+        pcr_by_strike: Optional[Dict[str, Any]] = None,
+        oi_distribution: Optional[Dict[str, Any]] = None,
+        pain_distribution: Optional[Dict[str, Any]] = None,
+        oi_flow: Optional[Dict[str, Any]] = None,
+        wall_sr_levels: Optional[Tuple[List[float], List[float]]] = None,
     ) -> TradingSignal:
         """
         Create a complete trading signal.
@@ -599,9 +691,15 @@ class PipelineOrchestrator:
             options_chain: Options chain data
             futures_data: Futures data
             whale_analysis: Whale activity analysis
+            whale_volume_analysis: Advanced whale volume analysis
             wall_analysis: Wall detection analysis
             gamma_analysis: Gamma exposure analysis for dealer hedging levels
             sentiment_analysis: Sentiment analysis from L/S ratios and funding rates
+            pcr_by_strike: PCR analysis by strike (from advanced analysis)
+            oi_distribution: OI distribution across strikes (from advanced analysis)
+            pain_distribution: Max pain distribution (from advanced analysis)
+            oi_flow: OI flow analysis (from advanced analysis)
+            wall_sr_levels: Support/resistance levels from walls (from advanced analysis)
             
         Returns:
             Complete TradingSignal
@@ -709,6 +807,37 @@ class PipelineOrchestrator:
                 "large_trades_count": whale_analysis.large_trades_count,
             }
         
+        # Add advanced whale volume analysis
+        if whale_volume_analysis:
+            summary = whale_volume_analysis.get("summary", {})
+            flow = whale_volume_analysis.get("flow", {})
+            concentration = whale_volume_analysis.get("concentration", {})
+            time_pattern = whale_volume_analysis.get("time_pattern", {})
+            block_trades = whale_volume_analysis.get("block_trades", {})
+            
+            whale_metrics.update({
+                # Summary
+                "whale_volume_sentiment": summary.get("overall_sentiment", "NEUTRAL"),
+                "whale_time_pattern": summary.get("time_pattern", "UNKNOWN"),
+                "whale_aggressive_side": summary.get("aggressive_side", "UNKNOWN"),
+                "whale_is_concentrated": summary.get("is_concentrated", False),
+                "whale_block_count": summary.get("block_count", 0),
+                "whale_block_sentiment": summary.get("block_sentiment", "NEUTRAL"),
+                
+                # Flow analysis
+                "whale_call_flow_net": flow.get("call_flow", {}).get("net", 0),
+                "whale_put_flow_net": flow.get("put_flow", {}).get("net", 0),
+                "whale_call_put_ratio": round(flow.get("call_put_ratio", 1.0), 2),
+                
+                # Concentration
+                "whale_top_strike": concentration.get("top_strike"),
+                "whale_top_strike_concentration": round(concentration.get("top_strike_concentration", 0), 3),
+                
+                # Block trades
+                "whale_block_total_volume": block_trades.get("total_volume", 0),
+                "whale_block_avg_size": round(block_trades.get("avg_size", 0), 2),
+            })
+        
         options_metrics = {
             "pcr_combined": options_signal.pcr_analysis.pcr_combined if options_signal.pcr_analysis else 1.0,
             "iv_percentile": options_signal.iv_analysis.iv_percentile if options_signal.iv_analysis else 0.5,
@@ -765,6 +894,63 @@ class PipelineOrchestrator:
         
         # Merge sentiment metrics into options_metrics
         options_metrics.update(sentiment_metrics)
+        
+        # Add advanced analysis metrics
+        advanced_metrics = {}
+        
+        # PCR by Strike Analysis
+        if pcr_by_strike:
+            advanced_metrics["pcr_by_strike"] = {
+                "put_heavy_count": pcr_by_strike.get("put_heavy_count", 0),
+                "call_heavy_count": pcr_by_strike.get("call_heavy_count", 0),
+                "avg_pcr": round(pcr_by_strike.get("avg_pcr", 1.0), 3),
+                # Include top 5 strike PCRs for reference
+                "top_strikes": [
+                    {"strike": s["strike"], "pcr": round(s["pcr"], 3), "distance_pct": s["distance_from_spot"]}
+                    for s in pcr_by_strike.get("strike_pcrs", [])[:5]
+                ],
+            }
+        
+        # OI Distribution Analysis
+        if oi_distribution:
+            advanced_metrics["oi_distribution"] = {
+                "total_oi": oi_distribution.get("total_oi", 0),
+                "total_call_oi": oi_distribution.get("total_call_oi", 0),
+                "total_put_oi": oi_distribution.get("total_put_oi", 0),
+                # Include top 5 strikes by total OI
+                "top_oi_strikes": [
+                    {"strike": s["strike"], "call_oi": s["call_oi"], "put_oi": s["put_oi"], "total_oi": s["total_oi"]}
+                    for s in sorted(oi_distribution.get("strikes", []), key=lambda x: x.get("total_oi", 0), reverse=True)[:5]
+                ],
+            }
+        
+        # Max Pain Distribution
+        if pain_distribution:
+            advanced_metrics["pain_distribution"] = {
+                "max_pain_strike": round(pain_distribution.get("max_pain_strike", 0), 2),
+                "max_pain_value": round(pain_distribution.get("max_pain_value", 0), 2),
+                "spot_price": round(pain_distribution.get("spot_price", 0), 2),
+                # Include top 5 strikes by pain value for context
+                "pain_gradient": [
+                    {"strike": p["strike"], "pain": round(p["pain"], 2)}
+                    for p in pain_distribution.get("distribution", [])[:5]
+                ],
+            }
+        
+        # OI Flow Analysis
+        if oi_flow:
+            advanced_metrics["oi_flow"] = oi_flow
+        
+        # Wall to S/R Conversion
+        if wall_sr_levels:
+            support_from_walls, resistance_from_walls = wall_sr_levels
+            advanced_metrics["wall_sr_conversion"] = {
+                "support_levels": support_from_walls[:5],
+                "resistance_levels": resistance_from_walls[:5],
+            }
+        
+        # Merge advanced metrics into options_metrics
+        options_metrics.update(advanced_metrics)
         
         futures_metrics = {
             "price": futures_data.price,

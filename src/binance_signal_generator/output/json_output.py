@@ -7,13 +7,14 @@ It supports:
 - Compact output for programmatic consumption
 - File output for logging/archival
 - stdout output for pipe integration
+- Full OutputConfig integration
 """
 
 import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from binance_signal_generator.models import (
     ExecutionResult,
@@ -26,6 +27,9 @@ from binance_signal_generator.models import (
     WhaleAnalysis,
 )
 from binance_signal_generator.utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from binance_signal_generator.config.loader import OutputConfig
 
 logger = get_logger(__name__)
 
@@ -68,11 +72,10 @@ class JSONOutput:
     - stdout or file output
     - Signal-specific formatting
     - Metadata enrichment
+    - Full OutputConfig support
     
     Attributes:
-        pretty: Enable pretty printing
-        output_file: Optional file path for output
-        include_metadata: Include execution metadata
+        config: OutputConfig object with all settings
     """
     
     def __init__(
@@ -80,6 +83,8 @@ class JSONOutput:
         pretty: bool = False,
         output_file: Optional[str] = None,
         include_metadata: bool = True,
+        include_selected_assets: bool = True,
+        config: Optional["OutputConfig"] = None,
     ):
         """
         Initialize JSON output handler.
@@ -88,16 +93,29 @@ class JSONOutput:
             pretty: Enable pretty printing with indentation
             output_file: Optional file path to write output
             include_metadata: Include execution metadata in output
+            include_selected_assets: Include selected assets list in output
+            config: OutputConfig object (overrides other parameters)
         """
-        self.pretty = pretty
-        self.output_file = output_file
-        self.include_metadata = include_metadata
+        if config is not None:
+            self.pretty = config.json_pretty_print
+            self.output_file = None  # File output handled separately
+            self.include_metadata = config.json_include_metadata
+            self.include_selected_assets = config.json_include_selected_assets
+            self.config = config
+        else:
+            self.pretty = pretty
+            self.output_file = output_file
+            self.include_metadata = include_metadata
+            self.include_selected_assets = include_selected_assets
+            self.config = None
         
         logger.debug(
             "JSON output initialized",
             extra={"data": {
-                "pretty": pretty,
-                "output_file": output_file,
+                "pretty": self.pretty,
+                "output_file": self.output_file,
+                "include_metadata": self.include_metadata,
+                "include_selected_assets": self.include_selected_assets,
             }}
         )
     
@@ -155,13 +173,15 @@ class JSONOutput:
         }
         
         if self.include_metadata:
-            output["selected_assets"] = result.selected_assets
             output["metadata"] = {
                 "config_file": result.config_path,
                 "api_calls_made": result.api_calls_made,
                 "data_freshness_seconds": result.data_freshness_seconds,
                 "errors": result.errors,
             }
+        
+        if self.include_selected_assets:
+            output["selected_assets"] = result.selected_assets
         
         return output
     
@@ -320,6 +340,7 @@ def output_signals(
     pretty: bool = False,
     output_file: Optional[str] = None,
     compact: bool = False,
+    config: Optional["OutputConfig"] = None,
 ) -> None:
     """
     Convenience function to output signals.
@@ -329,6 +350,7 @@ def output_signals(
         pretty: Pretty print JSON
         output_file: Optional file path
         compact: Output compact format
+        config: OutputConfig object (overrides other parameters)
     """
     if compact:
         # Output compact one signal per line
@@ -336,7 +358,7 @@ def output_signals(
             compact_data = JSONOutput.format_signal_compact(signal)
             print(json.dumps(compact_data, cls=JSONOutputEncoder))
     else:
-        output = JSONOutput(pretty=pretty, output_file=output_file)
+        output = JSONOutput(pretty=pretty, output_file=output_file, config=config)
         output.output(result)
 
 
