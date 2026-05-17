@@ -29,6 +29,8 @@ from binance_sdk_derivatives_trading_usds_futures.derivatives_trading_usds_futur
 from binance_signal_generator.models import (
     FuturesData,
     Kline,
+    LSRatioData,
+    FundingRateData,
 )
 from binance_signal_generator.utils.rate_limiter import RateLimiter
 from binance_signal_generator.utils.logging import get_logger
@@ -135,40 +137,47 @@ class FuturesFetcher:
         try:
             response = self.client.rest_api.ticker24hr_price_change_statistics(symbol=symbol)
             data = response.data()
-            
+
+            # CRITICAL FIX: Handle SDK actual_instance wrapper
+            # The SDK wraps the actual data in an 'actual_instance' attribute
+            # Debug showed: actual_instance: symbol='BTCUSDT' last_price='78235.90'
+            if hasattr(data, 'actual_instance'):
+                data = data.actual_instance
+                logger.debug(f"Unwrapped actual_instance for {symbol}")
+
+            # Debug: Log raw response type and structure
+            logger.debug(f"Futures API response type for {symbol}: {type(data)}")
+
             # Handle list response (API returns list with single item)
             if isinstance(data, list) and len(data) > 0:
                 data = data[0]
+
+            # Direct attribute access (SDK returns snake_case attributes)
+            # After unwrapping actual_instance, fields are directly accessible
+            price = float(getattr(data, 'last_price', 0) or 0)
+            volume = float(getattr(data, 'volume', 0) or 0)
+            high = float(getattr(data, 'high_price', 0) or 0)
+            low = float(getattr(data, 'low_price', 0) or 0)
+            price_change_pct = float(getattr(data, 'price_change_percent', 0) or 0)
             
-            # Handle response object
-            if hasattr(data, '__dict__'):
-                return FuturesData(
-                    symbol=symbol,
-                    price=float(getattr(data, 'last_price', 0) or getattr(data, 'lastPrice', 0) or 0),
-                    timestamp=datetime.utcnow(),
-                    volume_24h=float(getattr(data, 'volume', 0) or 0),
-                    open_interest=0.0,  # Fetched separately
-                    funding_rate=0.0,   # Fetched separately
-                    mark_price=float(getattr(data, 'last_price', 0) or getattr(data, 'lastPrice', 0) or 0),
-                    index_price=float(getattr(data, 'last_price', 0) or getattr(data, 'lastPrice', 0) or 0),
-                    high_24h=float(getattr(data, 'high_price', 0) or getattr(data, 'highPrice', 0) or 0),
-                    low_24h=float(getattr(data, 'low_price', 0) or getattr(data, 'lowPrice', 0) or 0),
-                    price_change_pct=float(getattr(data, 'price_change_percent', 0) or getattr(data, 'priceChangePercent', 0) or 0),
-                )
+            # Debug log the actual values
+            logger.info(
+                f"Futures ticker for {symbol}: price={price}, volume={volume}, "
+                f"high={high}, low={low}, change={price_change_pct}%"
+            )
             
-            # Handle dict response
             return FuturesData(
                 symbol=symbol,
-                price=float(data.get("lastPrice", 0) or 0),
+                price=price,
                 timestamp=datetime.utcnow(),
-                volume_24h=float(data.get("volume", 0) or 0),
+                volume_24h=volume,
                 open_interest=0.0,  # Fetched separately
                 funding_rate=0.0,   # Fetched separately
-                mark_price=float(data.get("lastPrice", 0) or 0),
-                index_price=float(data.get("lastPrice", 0) or 0),
-                high_24h=float(data.get("highPrice", 0) or 0),
-                low_24h=float(data.get("lowPrice", 0) or 0),
-                price_change_pct=float(data.get("priceChangePercent", 0) or 0),
+                mark_price=price,
+                index_price=price,
+                high_24h=high,
+                low_24h=low,
+                price_change_pct=price_change_pct,
             )
             
         except Exception as e:
@@ -331,25 +340,21 @@ class FuturesFetcher:
         try:
             response = self.client.rest_api.mark_price(symbol=symbol)
             data = response.data()
-            
+
+            # CRITICAL FIX: Handle SDK actual_instance wrapper
+            if hasattr(data, 'actual_instance'):
+                data = data.actual_instance
+
             # Handle list response (API returns list with single item)
             if isinstance(data, list) and len(data) > 0:
                 data = data[0]
-            
-            if hasattr(data, '__dict__'):
-                return {
-                    "symbol": symbol,
-                    "mark_price": float(getattr(data, 'mark_price', 0) or getattr(data, 'markPrice', 0) or 0),
-                    "index_price": float(getattr(data, 'index_price', 0) or getattr(data, 'indexPrice', 0) or 0),
-                    "last_funding_rate": float(getattr(data, 'last_funding_rate', 0) or getattr(data, 'lastFundingRate', 0) or 0),
-                    "time": datetime.utcnow(),
-                }
-            
+
+            # Direct attribute access (SDK returns snake_case after unwrapping)
             return {
                 "symbol": symbol,
-                "mark_price": float(data.get("markPrice", 0) or 0),
-                "index_price": float(data.get("indexPrice", 0) or 0),
-                "last_funding_rate": float(data.get("lastFundingRate", 0) or 0),
+                "mark_price": float(getattr(data, 'mark_price', 0) or 0),
+                "index_price": float(getattr(data, 'index_price', 0) or 0),
+                "last_funding_rate": float(getattr(data, 'last_funding_rate', 0) or 0),
                 "time": datetime.utcnow(),
             }
             
@@ -610,7 +615,577 @@ class FuturesFetcher:
         except Exception as e:
             logger.error(f"Failed to get available symbols: {e}")
             return []
-    
+
+    async def get_oi_statistics(
+        self,
+        symbol: str,
+        period: str = "1d",
+        limit: int = 7,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get Open Interest historical statistics.
+
+        API: GET /futures/data/openInterestHist
+        Weight: 0 (free!)
+
+        Used for calculating oi_change_pct in activity scoring.
+        Returns historical OI data to compare current vs past OI.
+
+        Response format:
+        [
+            {
+                "symbol": "BTCUSDT",
+                "sumOpenInterest": "20403.63700000",
+                "sumOpenInterestValue": "150570784.07809979",
+                "timestamp": "1583127900000"
+            }
+        ]
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            period: Time period ("5m","15m","30m","1h","2h","4h","6h","12h","1d")
+            limit: Number of data points (default 7 for 7-day change)
+
+        Returns:
+            List of OI statistics dictionaries with timestamp and sumOpenInterest
+        """
+        await self.rate_limiter.acquire()
+
+        try:
+            # Import the enum for period
+            from binance_sdk_derivatives_trading_usds_futures.rest_api.models import (
+                OpenInterestStatisticsPeriodEnum,
+            )
+
+            # Map period string to enum
+            period_map = {
+                "5m": "PERIOD_5m",
+                "15m": "PERIOD_15m",
+                "30m": "PERIOD_30m",
+                "1h": "PERIOD_1h",
+                "2h": "PERIOD_2h",
+                "4h": "PERIOD_4h",
+                "6h": "PERIOD_6h",
+                "12h": "PERIOD_12h",
+                "1d": "PERIOD_1d",
+            }
+
+            period_enum = OpenInterestStatisticsPeriodEnum[period_map.get(period, "PERIOD_1d")].value
+
+            response = self.client.rest_api.open_interest_statistics(
+                symbol=symbol,
+                period=period_enum,
+                limit=min(limit, 500),
+            )
+
+            data = response.data()
+
+            # Handle response
+            if data is None:
+                logger.warning(f"OI statistics response is None for {symbol}")
+                return []
+
+            # Convert to list
+            if isinstance(data, list):
+                items = data
+            elif hasattr(data, '__iter__') and not isinstance(data, dict):
+                items = list(data)
+            else:
+                items = [data] if data else []
+
+            # Extract relevant fields
+            result = []
+            for item in items:
+                if hasattr(item, '__dict__'):
+                    result.append({
+                        "symbol": getattr(item, 'symbol', symbol),
+                        "sum_open_interest": float(getattr(item, 'sum_open_interest', 0) or getattr(item, 'sumOpenInterest', 0) or 0),
+                        "sum_open_interest_value": float(getattr(item, 'sum_open_interest_value', 0) or getattr(item, 'sumOpenInterestValue', 0) or 0),
+                        "timestamp": getattr(item, 'timestamp', 0),
+                    })
+                elif isinstance(item, dict):
+                    result.append({
+                        "symbol": item.get("symbol", symbol),
+                        "sum_open_interest": float(item.get("sumOpenInterest", 0) or item.get("sum_open_interest", 0) or 0),
+                        "sum_open_interest_value": float(item.get("sumOpenInterestValue", 0) or item.get("sum_open_interest_value", 0) or 0),
+                        "timestamp": item.get("timestamp", 0),
+                    })
+
+            logger.debug(f"Fetched {len(result)} OI statistics for {symbol}")
+            return result
+
+        except Exception as e:
+            logger.error(f"Failed to fetch OI statistics for {symbol}: {e}")
+            return []
+
+    async def get_volume_history(
+        self,
+        symbol: str,
+        interval: str = "1d",
+        limit: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get historical volume data from klines.
+
+        API: GET /fapi/v1/klines
+        Weight: 1-5 depending on limit
+
+        Used for calculating volume_spike_score in activity scoring.
+        Returns historical volume data to detect volume spikes.
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            interval: Kline interval ("1m","5m","15m","1h","4h","1d")
+            limit: Number of klines (default 30 for 30-day average)
+
+        Returns:
+            List of volume dictionaries with timestamp and volume
+        """
+        await self.rate_limiter.acquire()
+
+        try:
+            # Import the enum for interval
+            from binance_sdk_derivatives_trading_usds_futures.rest_api.models import (
+                KlineCandlestickDataIntervalEnum,
+            )
+
+            # Map interval string to enum
+            interval_map = {
+                "1s": "INTERVAL_1s",
+                "1m": "INTERVAL_1m",
+                "3m": "INTERVAL_3m",
+                "5m": "INTERVAL_5m",
+                "15m": "INTERVAL_15m",
+                "30m": "INTERVAL_30m",
+                "1h": "INTERVAL_1h",
+                "2h": "INTERVAL_2h",
+                "4h": "INTERVAL_4h",
+                "6h": "INTERVAL_6h",
+                "8h": "INTERVAL_8h",
+                "12h": "INTERVAL_12h",
+                "1d": "INTERVAL_1d",
+                "3d": "INTERVAL_3d",
+                "1w": "INTERVAL_1w",
+                "1M": "INTERVAL_1M",
+            }
+
+            interval_enum = KlineCandlestickDataIntervalEnum[interval_map.get(interval, "INTERVAL_1d")].value
+
+            response = self.client.rest_api.kline_candlestick_data(
+                symbol=symbol,
+                interval=interval_enum,
+                limit=min(limit, 1500),
+            )
+
+            data = response.data()
+
+            # Handle response - klines are returned as arrays
+            if data is None:
+                logger.warning(f"Klines response is None for {symbol}")
+                return []
+
+            if hasattr(data, '__iter__') and not isinstance(data, dict):
+                klines_list = list(data)
+            else:
+                klines_list = data if isinstance(data, list) else []
+
+            # Parse kline data
+            # Format: [open_time, open, high, low, close, volume, close_time, ...]
+            result = []
+            for k in klines_list:
+                if isinstance(k, (list, tuple)) and len(k) >= 6:
+                    result.append({
+                        "open_time": k[0],
+                        "open": float(k[1]),
+                        "high": float(k[2]),
+                        "low": float(k[3]),
+                        "close": float(k[4]),
+                        "volume": float(k[5]),
+                        "close_time": k[6] if len(k) > 6 else 0,
+                    })
+
+            logger.debug(f"Fetched {len(result)} klines for {symbol}")
+            return result
+
+        except Exception as e:
+            logger.error(f"Failed to fetch klines for {symbol}: {e}")
+            return []
+
+    # =========================================================================
+    # Sentiment Data Methods (L/S Ratios, Funding Rate History)
+    # =========================================================================
+
+    async def get_top_trader_position_ratio(
+        self,
+        symbol: str,
+        period: str = "1h",
+        limit: int = 30,
+    ) -> List[LSRatioData]:
+        """
+        Get Top Trader Long/Short Ratio (Positions).
+        
+        API: GET /futures/data/topLongShortPositionRatio
+        Weight: 0 (FREE!)
+        IP Rate Limit: 1000 requests/5min
+        
+        The proportion of net long and net short positions to total open
+        positions of the top 20% users with the highest margin balance.
+        
+        Interpretation:
+        - Ratio > 1: Longs dominate (bullish sentiment from top traders)
+        - Ratio < 1: Shorts dominate (bearish sentiment from top traders)
+        - Extreme values (> 2 or < 0.5) may signal contrarian opportunity
+        
+        Response format:
+        [
+            {
+                "symbol": "BTCUSDT",
+                "longShortRatio": "1.4342",
+                "longAccount": "0.5891",
+                "shortAccount": "0.4108",
+                "timestamp": "1583139600000"
+            }
+        ]
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            period: Time period ("5m","15m","30m","1h","2h","4h","6h","12h","1d")
+            limit: Number of data points (default 30, max 500)
+            
+        Returns:
+            List of LSRatioData objects
+        """
+        await self.rate_limiter.acquire()
+        
+        try:
+            from binance_sdk_derivatives_trading_usds_futures.rest_api.models import (
+                TopTraderLongShortRatioPositionsPeriodEnum,
+            )
+            
+            # Map period string to enum
+            period_map = {
+                "5m": "PERIOD_5m",
+                "15m": "PERIOD_15m",
+                "30m": "PERIOD_30m",
+                "1h": "PERIOD_1h",
+                "2h": "PERIOD_2h",
+                "4h": "PERIOD_4h",
+                "6h": "PERIOD_6h",
+                "12h": "PERIOD_12h",
+                "1d": "PERIOD_1d",
+            }
+            
+            period_enum = TopTraderLongShortRatioPositionsPeriodEnum[
+                period_map.get(period, "PERIOD_1h")
+            ].value
+            
+            response = self.client.rest_api.top_trader_long_short_ratio_positions(
+                symbol=symbol,
+                period=period_enum,
+                limit=min(limit, 500),
+            )
+            
+            data = response.data()
+            
+            # Handle response
+            if data is None:
+                logger.warning(f"Top trader position ratio response is None for {symbol}")
+                return []
+            
+            # Convert to list
+            if isinstance(data, list):
+                items = data
+            elif hasattr(data, '__iter__') and not isinstance(data, dict):
+                items = list(data)
+            else:
+                items = [data] if data else []
+            
+            # Parse into LSRatioData objects
+            result = []
+            for item in items:
+                if hasattr(item, '__dict__'):
+                    timestamp_ms = int(getattr(item, 'timestamp', 0) or 0)
+                    result.append(LSRatioData(
+                        timestamp=datetime.fromtimestamp(timestamp_ms / 1000) if timestamp_ms else datetime.utcnow(),
+                        long_short_ratio=float(getattr(item, 'long_short_ratio', 1.0) or getattr(item, 'longShortRatio', 1.0) or 1.0),
+                        long_account=float(getattr(item, 'long_account', 0.5) or getattr(item, 'longAccount', 0.5) or 0.5),
+                        short_account=float(getattr(item, 'short_account', 0.5) or getattr(item, 'shortAccount', 0.5) or 0.5),
+                    ))
+                elif isinstance(item, dict):
+                    timestamp_ms = int(item.get("timestamp", 0) or 0)
+                    result.append(LSRatioData(
+                        timestamp=datetime.fromtimestamp(timestamp_ms / 1000) if timestamp_ms else datetime.utcnow(),
+                        long_short_ratio=float(item.get("longShortRatio", 1.0) or 1.0),
+                        long_account=float(item.get("longAccount", 0.5) or 0.5),
+                        short_account=float(item.get("shortAccount", 0.5) or 0.5),
+                    ))
+            
+            logger.debug(
+                f"Fetched {len(result)} top trader position ratio points for {symbol}",
+                extra={"data": {"period": period, "latest_ratio": result[-1].long_short_ratio if result else None}}
+            )
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch top trader position ratio for {symbol}: {e}")
+            return []
+
+    async def get_top_trader_account_ratio(
+        self,
+        symbol: str,
+        period: str = "1h",
+        limit: int = 30,
+    ) -> List[LSRatioData]:
+        """
+        Get Top Trader Long/Short Ratio (Accounts).
+        
+        API: GET /futures/data/topLongShortAccountRatio
+        Weight: 0 (FREE!)
+        IP Rate Limit: 1000 requests/5min
+        
+        The proportion of net long and net short accounts to total accounts
+        of the top 20% users with the highest margin balance.
+        Each account is counted once only.
+        
+        Interpretation:
+        - Shows how many accounts (not position size) are long vs short
+        - Can differ from position ratio - useful for detecting divergences
+        - May indicate "crowd" vs "smart money" positioning
+        
+        Response format:
+        [
+            {
+                "symbol": "BTCUSDT",
+                "longShortRatio": "1.8105",
+                "longAccount": "0.6442",
+                "shortAccount": "0.3558",
+                "timestamp": "1583139600000"
+            }
+        ]
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            period: Time period ("5m","15m","30m","1h","2h","4h","6h","12h","1d")
+            limit: Number of data points (default 30, max 500)
+            
+        Returns:
+            List of LSRatioData objects
+        """
+        await self.rate_limiter.acquire()
+        
+        try:
+            from binance_sdk_derivatives_trading_usds_futures.rest_api.models import (
+                TopTraderLongShortRatioAccountsPeriodEnum,
+            )
+            
+            # Map period string to enum
+            period_map = {
+                "5m": "PERIOD_5m",
+                "15m": "PERIOD_15m",
+                "30m": "PERIOD_30m",
+                "1h": "PERIOD_1h",
+                "2h": "PERIOD_2h",
+                "4h": "PERIOD_4h",
+                "6h": "PERIOD_6h",
+                "12m": "PERIOD_12h",
+                "1d": "PERIOD_1d",
+            }
+            
+            period_enum = TopTraderLongShortRatioAccountsPeriodEnum[
+                period_map.get(period, "PERIOD_1h")
+            ].value
+            
+            response = self.client.rest_api.top_trader_long_short_ratio_accounts(
+                symbol=symbol,
+                period=period_enum,
+                limit=min(limit, 500),
+            )
+            
+            data = response.data()
+            
+            # Handle response
+            if data is None:
+                logger.warning(f"Top trader account ratio response is None for {symbol}")
+                return []
+            
+            # Convert to list
+            if isinstance(data, list):
+                items = data
+            elif hasattr(data, '__iter__') and not isinstance(data, dict):
+                items = list(data)
+            else:
+                items = [data] if data else []
+            
+            # Parse into LSRatioData objects
+            result = []
+            for item in items:
+                if hasattr(item, '__dict__'):
+                    timestamp_ms = int(getattr(item, 'timestamp', 0) or 0)
+                    result.append(LSRatioData(
+                        timestamp=datetime.fromtimestamp(timestamp_ms / 1000) if timestamp_ms else datetime.utcnow(),
+                        long_short_ratio=float(getattr(item, 'long_short_ratio', 1.0) or getattr(item, 'longShortRatio', 1.0) or 1.0),
+                        long_account=float(getattr(item, 'long_account', 0.5) or getattr(item, 'longAccount', 0.5) or 0.5),
+                        short_account=float(getattr(item, 'short_account', 0.5) or getattr(item, 'shortAccount', 0.5) or 0.5),
+                    ))
+                elif isinstance(item, dict):
+                    timestamp_ms = int(item.get("timestamp", 0) or 0)
+                    result.append(LSRatioData(
+                        timestamp=datetime.fromtimestamp(timestamp_ms / 1000) if timestamp_ms else datetime.utcnow(),
+                        long_short_ratio=float(item.get("longShortRatio", 1.0) or 1.0),
+                        long_account=float(item.get("longAccount", 0.5) or 0.5),
+                        short_account=float(item.get("shortAccount", 0.5) or 0.5),
+                    ))
+            
+            logger.debug(
+                f"Fetched {len(result)} top trader account ratio points for {symbol}",
+                extra={"data": {"period": period, "latest_ratio": result[-1].long_short_ratio if result else None}}
+            )
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch top trader account ratio for {symbol}: {e}")
+            return []
+
+    async def get_funding_rate_history(
+        self,
+        symbol: str,
+        limit: int = 100,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> List[FundingRateData]:
+        """
+        Get Funding Rate History.
+        
+        API: GET /fapi/v1/fundingRate
+        Weight: 5
+        Rate Limit: Shares 500/5min/IP with GET /fapi/v1/fundingInfo
+        
+        Funding rates show the cost of holding perpetual positions:
+        - Positive funding: Longs pay shorts (overcrowded longs)
+        - Negative funding: Shorts pay longs (overcrowded shorts)
+        - Extreme funding often precedes reversals
+        
+        Response format:
+        [
+            {
+                "symbol": "BTCUSDT",
+                "fundingRate": "-0.03750000",
+                "fundingTime": 1570608000000,
+                "markPrice": "34287.54619963"
+            }
+        ]
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            limit: Number of records (default 100, max 1000)
+            start_time: Start timestamp in ms (optional)
+            end_time: End timestamp in ms (optional)
+            
+        Returns:
+            List of FundingRateData objects
+        """
+        await self.rate_limiter.acquire()
+        
+        try:
+            params = {"symbol": symbol, "limit": min(limit, 1000)}
+            if start_time:
+                params["startTime"] = start_time
+            if end_time:
+                params["endTime"] = end_time
+            
+            response = self.client.rest_api.get_funding_rate_history(**params)
+            data = response.data()
+            
+            # Handle response
+            if data is None:
+                logger.warning(f"Funding rate history response is None for {symbol}")
+                return []
+            
+            # Convert to list
+            if isinstance(data, list):
+                items = data
+            elif hasattr(data, '__iter__') and not isinstance(data, dict):
+                items = list(data)
+            else:
+                items = [data] if data else []
+            
+            # Parse into FundingRateData objects
+            result = []
+            for item in items:
+                if hasattr(item, '__dict__'):
+                    timestamp_ms = int(getattr(item, 'funding_time', 0) or getattr(item, 'fundingTime', 0) or 0)
+                    result.append(FundingRateData(
+                        timestamp=datetime.fromtimestamp(timestamp_ms / 1000) if timestamp_ms else datetime.utcnow(),
+                        funding_rate=float(getattr(item, 'funding_rate', 0) or getattr(item, 'fundingRate', 0) or 0),
+                        mark_price=float(getattr(item, 'mark_price', 0) or getattr(item, 'markPrice', 0) or 0),
+                    ))
+                elif isinstance(item, dict):
+                    timestamp_ms = int(item.get("fundingTime", 0) or 0)
+                    result.append(FundingRateData(
+                        timestamp=datetime.fromtimestamp(timestamp_ms / 1000) if timestamp_ms else datetime.utcnow(),
+                        funding_rate=float(item.get("fundingRate", 0) or 0),
+                        mark_price=float(item.get("markPrice", 0) or 0),
+                    ))
+            
+            logger.debug(
+                f"Fetched {len(result)} funding rate history points for {symbol}",
+                extra={"data": {
+                    "latest_rate": result[-1].funding_rate if result else None,
+                    "avg_rate": sum(r.funding_rate for r in result) / len(result) if result else 0,
+                }}
+            )
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch funding rate history for {symbol}: {e}")
+            return []
+
+    async def get_sentiment_data(
+        self,
+        symbol: str,
+        ls_period: str = "1h",
+        ls_limit: int = 30,
+        funding_limit: int = 168,  # ~7 days of 8-hour funding periods
+    ) -> Dict[str, Any]:
+        """
+        Get all sentiment-related data in parallel.
+        
+        Combines:
+        - Top Trader Position Ratio (FREE)
+        - Top Trader Account Ratio (FREE)
+        - Funding Rate History (weight 5)
+        
+        Total weight: 5 (minimal impact on rate limits)
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            ls_period: Period for L/S ratios
+            ls_limit: Number of L/S ratio data points
+            funding_limit: Number of funding rate data points
+            
+        Returns:
+            Dictionary with all sentiment data
+        """
+        logger.debug(f"Fetching sentiment data for {symbol}")
+        
+        # Fetch all in parallel
+        position_task = self.get_top_trader_position_ratio(symbol, ls_period, ls_limit)
+        account_task = self.get_top_trader_account_ratio(symbol, ls_period, ls_limit)
+        funding_task = self.get_funding_rate_history(symbol, funding_limit)
+        
+        position_data, account_data, funding_data = await asyncio.gather(
+            position_task, account_task, funding_task,
+            return_exceptions=True,
+        )
+        
+        return {
+            "symbol": symbol,
+            "top_trader_position": position_data if not isinstance(position_data, Exception) else [],
+            "top_trader_account": account_data if not isinstance(account_data, Exception) else [],
+            "funding_rate_history": funding_data if not isinstance(funding_data, Exception) else [],
+            "timestamp": datetime.utcnow(),
+        }
+
     async def close(self) -> None:
         """Close the client connection."""
         logger.info("Futures fetcher closed")

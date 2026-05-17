@@ -16,8 +16,8 @@
 │  │   └── validators.py                                             │
 │  │                                                                  │
 │  ├── data/                     # Data fetching layer               │
-│  │   ├── options_fetcher.py    # Uses binance.options SDK         │
-│  │   ├── futures_fetcher.py    # Uses binance.um_futures SDK      │
+│  │   ├── options_fetcher.py    # Options SDK client                │
+│  │   ├── futures_fetcher.py    # Futures SDK + Sentiment APIs      │
 │  │   └── cache.py                                                  │
 │  │                                                                  │
 │  ├── ranking/                  # ASSET RANKING                     │
@@ -30,10 +30,12 @@
 │  │   ├── oi_analyzer.py                                            │
 │  │   ├── wall_detector.py      # Detect Options walls             │
 │  │   ├── max_pain.py                                               │
+│  │   ├── gamma_exposure.py     # NEW: GEX calculator              │
+│  │   ├── sentiment.py          # NEW: L/S + Funding analysis      │
 │  │   └── signal_scorer.py                                          │
 │  │                                                                  │
 │  ├── whale/                    # WHALE DETECTION                   │
-│  │   ├── whale_detector.py     # Detect whale trades              │
+│  │   ├── whale_detector.py     # Asset-specific thresholds        │
 │  │   └── volume_analyzer.py    # Analyze whale volumes            │
 │  │                                                                  │
 │  ├── validation/               # Futures validation                │
@@ -42,7 +44,7 @@
 │  ├── output/                   # Signal output layer               │
 │  │   ├── json_output.py        # JSON output to stdout (PRIMARY)  │
 │  │   ├── signal_generator.py   # Create signal objects            │
-│  │   ├── sr_levels.py          # S/R level calculator             │
+│  │   ├── sr_levels.py          # S/R + Gamma levels               │
 │  │   └── database.py           # SQLite persistence (SECONDARY)   │
 │  │                                                                  │
 │  └── utils/                    # Utilities                        │
@@ -50,10 +52,9 @@
 │      └── helpers.py                                                │
 │                                                                     │
 │  SDK Dependencies:                                                  │
-│  ├── binance-connector (Official Binance Python SDK)               │
-│  ├── binance.um_futures (USDT-M Futures)                           │
-│  └── binance.options (Binance Options)                             │
-│                                                                     │
+│  ├── binance-sdk-derivatives-trading-options (Official SDK)        │
+│  ├── binance-sdk-derivatives-trading-usds-futures (Official SDK)   │
+│  │                                                                  │
 │  NOTE: No internal scheduling or Telegram notifications            │
 │        These are handled externally                                │
 │                                                                     │
@@ -66,34 +67,23 @@
 
 ### Overview
 
-The data fetching module uses the **official Binance Connector Python SDK** for reliable API interactions. This provides:
+The data fetching module uses the **official Binance Python SDK** for reliable API interactions. This provides:
 - Built-in rate limiting
 - Automatic request signing
 - Error handling and retries
 - Connection pooling
 
-### SDK Installation
-
-```bash
-# Install via pip (included in project dependencies)
-pip install binance-connector
-
-# Or install the full project
-pip install -e .
-```
-
 ### 0.1 Options Fetcher (`data/options_fetcher.py`)
 
-Uses `binance.options` module for Binance Options API:
+Uses Options SDK for Binance Options API:
 
 ```python
 # binance_signal_generator/data/options_fetcher.py
 
-from binance.options import Options
+from binance_sdk_derivatives_trading_options import DerivativesTradingOptions
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
-import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
@@ -135,201 +125,53 @@ class OptionsFetcher:
     """
     Fetches Options data using official Binance Options SDK.
     
-    SDK Documentation:
-    - https://github.com/binance/binance-connector-python/tree/master/clients/derivatives_trading_options
-    - https://binance-docs.github.io/apidocs/options/en/
+    Features:
+        - Asset-specific whale thresholds
+        - Intraday multi-timeframe support
+        - GEX calculation data
     """
     
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
-        """
-        Initialize Options client.
-        
-        Args:
-            api_key: Binance API key
-            api_secret: Binance API secret
-            testnet: Use testnet (default: False)
-        """
-        self.client = Options(
-            key=api_key,
-            secret=api_secret,
-            base_url='https://testnet.binanceops.com' if testnet else 'https://eapi.binance.com'
-        )
-        self._rate_limiter = RateLimiter(requests_per_second=10)
+    # Asset-specific whale thresholds
+    ASSET_THRESHOLDS = {
+        'BTCUSDT': {'min_premium': 500000, 'block_threshold': 2000000},
+        'ETHUSDT': {'min_premium': 200000, 'block_threshold': 1000000},
+        'DEFAULT': {'min_premium': 100000, 'block_threshold': 500000}
+    }
     
-    async def get_available_symbols(self) -> List[str]:
-        """
-        Get all available Options symbols.
-        
-        API: GET /eapi/v1/exchangeInfo
-        """
-        await self._rate_limiter.acquire()
-        
-        response = self.client.exchange_info()
-        symbols = set()
-        
-        for symbol_info in response.get('optionSymbols', []):
-            # Extract underlying (e.g., "BTCUSDT" from "BTC-240115-42000-C")
-            underlying = symbol_info.get('underlying', '')
-            if underlying:
-                symbols.add(underlying)
-        
-        return list(symbols)
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
+        self.client = DerivativesTradingOptions(
+            api_key=api_key,
+            api_secret=api_secret,
+            base_url='https://eapi.binance.com'
+        )
+    
+    def get_thresholds(self, symbol: str) -> Dict:
+        """Get asset-specific whale thresholds."""
+        return self.ASSET_THRESHOLDS.get(
+            symbol.replace('USDT', 'USDT'),
+            self.ASSET_THRESHOLDS['DEFAULT']
+        )
     
     async def get_option_chain(self, underlying: str) -> OptionsChain:
-        """
-        Get complete options chain for an underlying asset.
-        
-        API: GET /eapi/v1/optionChain
-        """
-        await self._rate_limiter.acquire()
-        
-        try:
-            response = self.client.option_chain(underlying=underlying)
-            
-            # Parse response
-            spot_price = float(response.get('underlyingPrice', 0))
-            
-            strikes = {}
-            total_call_oi = 0
-            total_put_oi = 0
-            total_call_volume = 0.0
-            total_put_volume = 0.0
-            
-            for option_data in response.get('optionChain', []):
-                strike_price = float(option_data.get('strikePrice', 0))
-                
-                # Parse call data
-                call_data = option_data.get('call', {})
-                call = OptionData(
-                    open_interest=int(call_data.get('openInterest', 0)),
-                    volume=int(call_data.get('volume', 0)),
-                    iv=float(call_data.get('impliedVolatility', 0)),
-                    delta=float(call_data.get('delta', 0)),
-                    gamma=float(call_data.get('gamma', 0)),
-                    theta=float(call_data.get('theta', 0)),
-                    vega=float(call_data.get('vega', 0)),
-                    last_price=float(call_data.get('lastPrice', 0)),
-                    bid=float(call_data.get('bidPrice', 0)),
-                    ask=float(call_data.get('askPrice', 0))
-                )
-                total_call_oi += call.open_interest
-                total_call_volume += call.volume * call.last_price
-                
-                # Parse put data
-                put_data = option_data.get('put', {})
-                put = OptionData(
-                    open_interest=int(put_data.get('openInterest', 0)),
-                    volume=int(put_data.get('volume', 0)),
-                    iv=float(put_data.get('impliedVolatility', 0)),
-                    delta=float(put_data.get('delta', 0)),
-                    gamma=float(put_data.get('gamma', 0)),
-                    theta=float(put_data.get('theta', 0)),
-                    vega=float(put_data.get('vega', 0)),
-                    last_price=float(put_data.get('lastPrice', 0)),
-                    bid=float(put_data.get('bidPrice', 0)),
-                    ask=float(put_data.get('askPrice', 0))
-                )
-                total_put_oi += put.open_interest
-                total_put_volume += put.volume * put.last_price
-                
-                strikes[strike_price] = StrikeData(
-                    strike=strike_price,
-                    call=call,
-                    put=put
-                )
-            
-            return OptionsChain(
-                underlying=underlying,
-                spot_price=spot_price,
-                timestamp=datetime.utcnow(),
-                strikes=strikes,
-                total_call_oi=total_call_oi,
-                total_put_oi=total_put_oi,
-                total_call_volume=total_call_volume,
-                total_put_volume=total_put_volume
-            )
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch options chain for {underlying}: {e}")
-            raise DataFetchError(f"Options chain fetch failed: {e}")
+        """Get complete options chain for an underlying."""
+        ...
     
-    async def get_open_interest(self, symbol: str) -> Dict:
-        """
-        Get open interest for a specific option symbol.
-        
-        API: GET /eapi/v1/openInterest
-        """
-        await self._rate_limiter.acquire()
-        
-        response = self.client.open_interest(symbol=symbol)
-        return {
-            'symbol': response.get('symbol'),
-            'open_interest': float(response.get('openInterest', 0)),
-            'time': datetime.fromtimestamp(response.get('time', 0) / 1000)
-        }
-    
-    async def get_recent_trades(self, underlying: str, limit: int = 500) -> List[Dict]:
-        """
-        Get recent trades for whale detection.
-        
-        API: GET /eapi/v1/trades
-        """
-        await self._rate_limiter.acquire()
-        
-        response = self.client.recent_trades(
-            underlying=underlying,
-            limit=limit
-        )
-        
-        trades = []
-        for trade in response:
-            trades.append({
-                'trade_id': trade.get('id'),
-                'price': float(trade.get('price', 0)),
-                'qty': float(trade.get('qty', 0)),
-                'quote_qty': float(trade.get('quoteQty', 0)),
-                'time': datetime.fromtimestamp(trade.get('time', 0) / 1000),
-                'side': trade.get('side'),  # BUY or SELL
-                'symbol': trade.get('symbol'),
-                'premium': float(trade.get('quoteQty', 0))  # $ value
-            })
-        
-        return trades
-    
-    async def get_activity_summary(self, underlying: str) -> Dict:
-        """
-        Get quick activity summary for asset ranking.
-        Combines multiple lightweight API calls.
-        """
-        await self._rate_limiter.acquire()
-        
-        # Get ticker
-        ticker = self.client.ticker_24hr(underlying=underlying)
-        
-        return {
-            'underlying': underlying,
-            'total_volume': float(ticker.get('volume', 0)),
-            'volume_change_pct': float(ticker.get('priceChangePercent', 0)),
-            'oi_change_24h': 0.0,  # Would need historical data
-            'iv_percentile': 0.5,  # Would need calculation
-            'pcr': float(ticker.get('putCallRatio', 1.0)),
-            'active_strikes': int(ticker.get('activeStrikes', 0)),
-            'whale_activity_score': 0.0  # Calculated separately
-        }
+    async def get_block_trades(self, underlying: str, limit: int = 500) -> List[Dict]:
+        """Get recent block trades for whale detection."""
+        ...
 ```
 
 ### 0.2 Futures Fetcher (`data/futures_fetcher.py`)
 
-Uses `binance.um_futures` module for USDT-M Futures API:
+Uses Futures SDK for USDT-M Futures API with **sentiment data**:
 
 ```python
 # binance_signal_generator/data/futures_fetcher.py
 
-from binance.um_futures import UMFutures
+from binance_sdk_derivatives_trading_usds_futures import DerivativesTradingUsdsFutures
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
-import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
@@ -350,541 +192,522 @@ class FuturesData:
     price_change_pct: float
 
 @dataclass
-class FuturesValidationResult:
-    """Validation result for futures trading conditions"""
-    symbol: str
-    liquidity_score: float
-    trend_alignment: str
-    volatility_state: str
-    funding_rate_ok: bool
-    passed: bool
-    reasons: List[str]
+class SentimentData:
+    """NEW: Sentiment data from L/S ratios and funding"""
+    position_ratio: float          # Top trader L/S position ratio
+    account_ratio: float           # Top trader L/S account ratio
+    funding_rate: float            # Current funding rate
+    funding_rate_avg_7d: float     # 7-day average funding
+    funding_history: List[Dict]    # Historical funding rates
+    timestamp: datetime
 
 class FuturesFetcher:
     """
-    Fetches USDT-M Futures data using official Binance Futures SDK.
+    Fetches USDT-M Futures data + Sentiment data.
     
-    SDK Documentation:
-    - https://github.com/binance/binance-connector-python/tree/master/clients/derivatives_trading_coin_futures
-    - https://binance-docs.github.io/apidocs/futures/en/
-    
-    Note: We use USDT-M Futures (um_futures) for trading BTCUSDT, ETHUSDT, etc.
+    NEW: Sentiment APIs
+        - Top Trader L/S Position Ratio (FREE)
+        - Top Trader L/S Account Ratio (FREE)
+        - Funding Rate History (Weight: 5)
     """
     
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
-        """
-        Initialize USDT-M Futures client.
-        
-        Args:
-            api_key: Binance API key
-            api_secret: Binance API secret
-            testnet: Use testnet (default: False)
-        """
-        self.client = UMFutures(
-            key=api_key,
-            secret=api_secret,
-            base_url='https://testnet.binancefuture.com' if testnet else 'https://fapi.binance.com'
+        self.client = DerivativesTradingUsdsFutures(
+            api_key=api_key,
+            api_secret=api_secret,
+            base_url='https://fapi.binance.com'
         )
-        self._rate_limiter = RateLimiter(requests_per_second=10)
     
-    async def get_price(self, symbol: str) -> FuturesData:
+    async def get_sentiment_data(self, symbol: str) -> SentimentData:
         """
-        Get current price and 24hr ticker data.
+        Fetch sentiment data from multiple APIs.
         
-        API: GET /fapi/v1/ticker/24hr
+        APIs Used:
+            - top_trader_long_short_ratio_positions (FREE)
+            - top_trader_long_short_ratio_accounts (FREE)
+            - get_funding_rate_history (Weight: 5)
         """
-        await self._rate_limiter.acquire()
+        # Get L/S ratios
+        position_ratio = await self._get_top_trader_position_ratio(symbol)
+        account_ratio = await self._get_top_trader_account_ratio(symbol)
         
-        response = self.client.ticker_24hr(symbol=symbol)
+        # Get funding rate history
+        funding_history = await self._get_funding_rate_history(symbol, limit=168)
         
-        return FuturesData(
+        return SentimentData(
+            position_ratio=position_ratio,
+            account_ratio=account_ratio,
+            funding_rate=funding_history[0]['fundingRate'] if funding_history else 0,
+            funding_rate_avg_7d=self._calc_avg_funding(funding_history),
+            funding_history=funding_history,
+            timestamp=datetime.utcnow()
+        )
+    
+    async def _get_top_trader_position_ratio(self, symbol: str) -> float:
+        """
+        Get Top Trader Long/Short Position Ratio.
+        
+        API: GET /futures/data/topLongShortPositionRatio
+        Weight: 0 (FREE)
+        IP Rate Limit: 1000/5min
+        """
+        response = self.client.rest_api.top_trader_long_short_ratio_positions(
             symbol=symbol,
-            price=float(response.get('lastPrice', 0)),
-            timestamp=datetime.utcnow(),
-            volume_24h=float(response.get('quoteVolume', 0)),
-            open_interest=0.0,  # Fetched separately
-            funding_rate=0.0,   # Fetched separately
-            mark_price=float(response.get('lastPrice', 0)),
-            index_price=float(response.get('lastPrice', 0)),
-            high_24h=float(response.get('highPrice', 0)),
-            low_24h=float(response.get('lowPrice', 0)),
-            price_change_pct=float(response.get('priceChangePercent', 0))
+            period="1h",
+            limit=30
         )
+        # Returns: longShortRatio, longAccount, shortAccount, timestamp
+        if response and len(response) > 0:
+            return float(response[0].get('longShortRatio', 1.0))
+        return 1.0
     
-    async def get_all_data(self, symbol: str) -> FuturesData:
+    async def _get_top_trader_account_ratio(self, symbol: str) -> float:
         """
-        Get complete futures data for a symbol.
-        Combines price, open interest, and funding rate.
+        Get Top Trader Long/Short Account Ratio.
+        
+        API: GET /futures/data/topLongShortAccountRatio
+        Weight: 0 (FREE)
+        IP Rate Limit: 1000/5min
         """
-        # Parallel fetch for efficiency
-        price_task = self.get_price(symbol)
-        oi_task = self.get_open_interest(symbol)
-        funding_task = self.get_funding_rate(symbol)
-        mark_task = self.get_mark_price(symbol)
-        
-        price_data, oi_data, funding_data, mark_data = await asyncio.gather(
-            price_task, oi_task, funding_task, mark_task
-        )
-        
-        return FuturesData(
+        response = self.client.rest_api.top_trader_long_short_ratio_accounts(
             symbol=symbol,
-            price=price_data.price,
-            timestamp=datetime.utcnow(),
-            volume_24h=price_data.volume_24h,
-            open_interest=oi_data.get('open_interest', 0),
-            funding_rate=funding_data.get('funding_rate', 0),
-            mark_price=mark_data.get('mark_price', 0),
-            index_price=mark_data.get('index_price', 0),
-            high_24h=price_data.high_24h,
-            low_24h=price_data.low_24h,
-            price_change_pct=price_data.price_change_pct
+            period="1h",
+            limit=30
         )
+        # Returns: longShortRatio, longAccount, shortAccount, timestamp
+        if response and len(response) > 0:
+            return float(response[0].get('longShortRatio', 1.0))
+        return 1.0
     
-    async def get_open_interest(self, symbol: str) -> Dict:
+    async def _get_funding_rate_history(self, symbol: str, limit: int = 168) -> List[Dict]:
         """
-        Get open interest for futures.
-        
-        API: GET /fapi/v1/openInterest
-        """
-        await self._rate_limiter.acquire()
-        
-        response = self.client.open_interest(symbol=symbol)
-        return {
-            'symbol': symbol,
-            'open_interest': float(response.get('openInterest', 0)),
-            'time': datetime.utcnow()
-        }
-    
-    async def get_funding_rate(self, symbol: str) -> Dict:
-        """
-        Get current funding rate.
+        Get Funding Rate History.
         
         API: GET /fapi/v1/fundingRate
+        Weight: 5 (shares 500/5min/IP with fundingInfo)
         """
-        await self._rate_limiter.acquire()
-        
-        response = self.client.funding_rate(symbol=symbol, limit=1)
-        if response:
-            return {
-                'symbol': symbol,
-                'funding_rate': float(response[0].get('fundingRate', 0)),
-                'time': datetime.fromtimestamp(response[0].get('fundingTime', 0) / 1000)
-            }
-        return {'symbol': symbol, 'funding_rate': 0.0, 'time': datetime.utcnow()}
-    
-    async def get_mark_price(self, symbol: str) -> Dict:
-        """
-        Get mark price and index price.
-        
-        API: GET /fapi/v1/premiumIndex
-        """
-        await self._rate_limiter.acquire()
-        
-        response = self.client.mark_price(symbol=symbol)
-        return {
-            'symbol': symbol,
-            'mark_price': float(response.get('markPrice', 0)),
-            'index_price': float(response.get('indexPrice', 0)),
-            'time': datetime.utcnow()
-        }
-    
-    async def get_klines(
-        self, 
-        symbol: str, 
-        interval: str = '15m', 
-        limit: int = 100
-    ) -> List[Dict]:
-        """
-        Get klines/candlesticks for trend analysis.
-        
-        API: GET /fapi/v1/klines
-        
-        Args:
-            symbol: Trading pair
-            interval: Kline interval (1m, 5m, 15m, 1h, 4h, 1d)
-            limit: Number of klines
-        """
-        await self._rate_limiter.acquire()
-        
-        response = self.client.klines(symbol=symbol, interval=interval, limit=limit)
-        
-        klines = []
-        for k in response:
-            klines.append({
-                'open_time': datetime.fromtimestamp(k[0] / 1000),
-                'open': float(k[1]),
-                'high': float(k[2]),
-                'low': float(k[3]),
-                'close': float(k[4]),
-                'volume': float(k[5]),
-                'close_time': datetime.fromtimestamp(k[6] / 1000)
-            })
-        
-        return klines
-    
-    async def check_liquidity(self, symbol: str, min_volume: float = 1_000_000) -> bool:
-        """
-        Check if symbol has sufficient liquidity.
-        """
-        data = await self.get_price(symbol)
-        return data.volume_24h >= min_volume
-```
-
-### 0.3 Rate Limiter (`data/rate_limiter.py`)
-
-Simple rate limiter for API calls:
-
-```python
-# binance_signal_generator/data/rate_limiter.py
-
-import asyncio
-import time
-from dataclasses import dataclass
-
-@dataclass
-class RateLimiter:
-    """Simple rate limiter for API calls"""
-    requests_per_second: int = 10
-    burst: int = 20
-    
-    def __post_init__(self):
-        self._tokens = self.burst
-        self._last_update = time.monotonic()
-        self._lock = asyncio.Lock()
-    
-    async def acquire(self):
-        """Acquire a token, waiting if necessary."""
-        async with self._lock:
-            now = time.monotonic()
-            elapsed = now - self._last_update
-            
-            # Replenish tokens
-            self._tokens = min(
-                self.burst,
-                self._tokens + elapsed * self.requests_per_second
-            )
-            self._last_update = now
-            
-            if self._tokens < 1:
-                # Wait for a token
-                wait_time = (1 - self._tokens) / self.requests_per_second
-                await asyncio.sleep(wait_time)
-                self._tokens = 0
-            else:
-                self._tokens -= 1
+        response = self.client.rest_api.get_funding_rate_history(
+            symbol=symbol,
+            limit=limit
+        )
+        # Returns: symbol, fundingRate, fundingTime, markPrice
+        return response if response else []
 ```
 
 ---
 
-## 1. Ranking Module (NEW)
+## 1. Sentiment Analysis Module (NEW)
 
-### 1.1 Activity Scorer (`ranking/activity_scorer.py`)
+### `analysis/sentiment.py`
 
 ```python
-# binance_signal_generator/ranking/activity_scorer.py
+# binance_signal_generator/analysis/sentiment.py
 
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
 from enum import Enum
-
-class ActivityDriver(Enum):
-    OI_CHANGE = "OI_CHANGE"
-    VOLUME_SPIKE = "VOLUME_SPIKE"
-    IV_INTEREST = "IV_INTEREST"
-    PCR_EXTREME = "PCR_EXTREME"
-    WHALE_ACTIVITY = "WHALE_ACTIVITY"
-    TOTAL_VOLUME = "TOTAL_VOLUME"
-
-@dataclass
-class ActivityMetrics:
-    """Activity metrics for a single asset"""
-    symbol: str
-    timestamp: datetime
-    
-    # Individual metrics
-    oi_change_pct: float              # Open Interest change % (last 24h)
-    volume_spike_score: float         # Volume vs 7-day average (0-1)
-    iv_percentile: float              # Current IV percentile (0-1)
-    pcr_extremeness: float            # How extreme is PCR (0-1)
-    whale_activity: float             # Whale activity indicator (0-1)
-    total_options_volume: float       # Total options volume in $
-    num_strikes_active: int           # Strikes with significant OI
-    
-    # Calculated
-    activity_score: float = 0.0       # Combined score (0-1)
-    primary_driver: str = ""          # Main activity driver
-
-@dataclass
-class ActivityScanResult:
-    """Result of activity scan across all assets"""
-    timestamp: datetime
-    total_assets_scanned: int
-    metrics_by_symbol: Dict[str, ActivityMetrics]
-    ranked_symbols: List[str]         # Symbols sorted by score
-    scan_duration_seconds: float
-
-class ActivityScorer:
-    """
-    Scores assets by Options market activity level.
-    
-    Purpose:
-        Quickly scan all assets to identify which have the most
-        interesting Options activity for detailed analysis.
-    
-    Activity Score Formula:
-        score = w1*oi_change + w2*volume_spike + w3*iv_percentile 
-              + w4*pcr_extreme + w5*whale_activity + w6*total_volume
-    """
-    
-    DEFAULT_WEIGHTS = {
-        ActivityDriver.OI_CHANGE: 0.25,
-        ActivityDriver.VOLUME_SPIKE: 0.20,
-        ActivityDriver.IV_INTEREST: 0.15,
-        ActivityDriver.PCR_EXTREME: 0.15,
-        ActivityDriver.WHALE_ACTIVITY: 0.15,
-        ActivityDriver.TOTAL_VOLUME: 0.10
-    }
-    
-    def __init__(self, config: 'Config'):
-        self.config = config
-        self.weights = self.DEFAULT_WEIGHTS.copy()
-        
-        # Thresholds
-        self.oi_change_max = 20.0      # 20% change = max score
-        self.volume_spike_max = 5.0    # 5x average = max score
-        self.total_volume_max = 100_000_000  # $100M = max score
-    
-    def calculate_score(self, metrics: ActivityMetrics) -> float:
-        """
-        Calculate normalized activity score (0-1).
-        
-        Higher score = More interesting activity.
-        """
-        # Normalize each component
-        oi_change_norm = min(abs(metrics.oi_change_pct) / self.oi_change_max, 1.0)
-        volume_norm = min(metrics.volume_spike_score / self.volume_spike_max, 1.0)
-        iv_norm = metrics.iv_percentile
-        pcr_norm = metrics.pcr_extremeness
-        whale_norm = metrics.whale_activity
-        volume_total_norm = min(metrics.total_options_volume / self.total_volume_max, 1.0)
-        
-        # Weighted sum
-        score = (
-            self.weights[ActivityDriver.OI_CHANGE] * oi_change_norm +
-            self.weights[ActivityDriver.VOLUME_SPIKE] * volume_norm +
-            self.weights[ActivityDriver.IV_INTEREST] * iv_norm +
-            self.weights[ActivityDriver.PCR_EXTREME] * pcr_norm +
-            self.weights[ActivityDriver.WHALE_ACTIVITY] * whale_norm +
-            self.weights[ActivityDriver.TOTAL_VOLUME] * volume_total_norm
-        )
-        
-        return min(score, 1.0)
-    
-    def identify_primary_driver(self, metrics: ActivityMetrics) -> ActivityDriver:
-        """Identify which metric is driving the most activity."""
-        contributions = {
-            ActivityDriver.OI_CHANGE: abs(metrics.oi_change_pct) / self.oi_change_max,
-            ActivityDriver.VOLUME_SPIKE: metrics.volume_spike_score / self.volume_spike_max,
-            ActivityDriver.IV_INTEREST: metrics.iv_percentile,
-            ActivityDriver.PCR_EXTREME: metrics.pcr_extremeness,
-            ActivityDriver.WHALE_ACTIVITY: metrics.whale_activity,
-            ActivityDriver.TOTAL_VOLUME: min(metrics.total_options_volume / self.total_volume_max, 1.0)
-        }
-        return max(contributions, key=contributions.get)
-    
-    def score_metrics(self, metrics: ActivityMetrics) -> ActivityMetrics:
-        """Calculate and populate score in metrics object."""
-        metrics.activity_score = self.calculate_score(metrics)
-        metrics.primary_driver = self.identify_primary_driver(metrics).value
-        return metrics
-    
-    async def scan_all_assets(self) -> ActivityScanResult:
-        """
-        Scan all available assets for activity scoring.
-        
-        Uses lightweight API calls to minimize latency.
-        Target: Complete within 30 seconds.
-        """
-        start_time = datetime.utcnow()
-        
-        # Get all symbols
-        symbols = await self._get_available_symbols()
-        
-        # Fetch quick metrics for each
-        metrics_by_symbol = {}
-        for symbol in symbols:
-            try:
-                quick_data = await self._fetch_quick_metrics(symbol)
-                metrics = self._build_metrics(symbol, quick_data)
-                metrics = self.score_metrics(metrics)
-                metrics_by_symbol[symbol] = metrics
-            except Exception as e:
-                logger.warning(f"Failed to scan {symbol}: {e}")
-        
-        # Rank by score
-        ranked = sorted(
-            metrics_by_symbol.keys(),
-            key=lambda s: metrics_by_symbol[s].activity_score,
-            reverse=True
-        )
-        
-        duration = (datetime.utcnow() - start_time).total_seconds()
-        
-        return ActivityScanResult(
-            timestamp=start_time,
-            total_assets_scanned=len(symbols),
-            metrics_by_symbol=metrics_by_symbol,
-            ranked_symbols=ranked,
-            scan_duration_seconds=duration
-        )
-    
-    async def _fetch_quick_metrics(self, symbol: str) -> dict:
-        """Fetch lightweight metrics for a single symbol."""
-        # Single API call for ticker + OI summary
-        return await self.fetcher.get_activity_summary(symbol)
-    
-    def _build_metrics(self, symbol: str, data: dict) -> ActivityMetrics:
-        """Build ActivityMetrics from API response."""
-        return ActivityMetrics(
-            symbol=symbol,
-            timestamp=datetime.utcnow(),
-            oi_change_pct=data.get('oi_change_24h', 0.0),
-            volume_spike_score=data.get('volume_vs_avg', 0.0),
-            iv_percentile=data.get('iv_percentile', 0.0),
-            pcr_extremeness=self._calc_pcr_extreme(data.get('pcr', 1.0)),
-            whale_activity=data.get('whale_activity_score', 0.0),
-            total_options_volume=data.get('total_volume', 0.0),
-            num_strikes_active=data.get('active_strikes', 0)
-        )
-    
-    def _calc_pcr_extreme(self, pcr: float) -> float:
-        """Calculate how extreme PCR is (0 = neutral, 1 = very extreme)."""
-        # PCR = 1.0 is neutral
-        # PCR > 1.5 or < 0.5 is very extreme
-        if pcr > 1.0:
-            return min((pcr - 1.0) / 0.5, 1.0)
-        else:
-            return min((1.0 - pcr) / 0.5, 1.0)
-```
-
-### 1.2 Asset Selector (`ranking/asset_selector.py`)
-
-```python
-# binance_signal_generator/ranking/asset_selector.py
-
-from dataclasses import dataclass
-from typing import List, Optional
 import logging
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class RankedAsset:
-    """An asset selected for detailed analysis"""
-    symbol: str
-    rank: int
-    activity_score: float
-    primary_driver: str
-    quick_metrics: dict
-    selection_reason: str
+class SentimentSignal(Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+    NEUTRAL = "NEUTRAL"
 
-class AssetSelector:
+@dataclass
+class SentimentResult:
+    """Result of sentiment analysis"""
+    # Raw inputs
+    position_ratio: float          # Top trader position L/S ratio
+    account_ratio: float           # Top trader account L/S ratio
+    funding_rate: float            # Current funding rate
+    funding_rate_avg_7d: float     # 7-day average funding
+    
+    # Processed
+    funding_rate_extreme: bool     # Is funding extreme?
+    combined_score: float          # Combined sentiment score (0-1)
+    signal: str                    # LONG, SHORT, NEUTRAL
+    is_contrarian: bool            # Contrarian signal detected
+    
+    # Timestamp
+    timestamp: datetime
+
+class SentimentAnalyzer:
     """
-    Selects top N assets for detailed analysis.
+    Analyzes market sentiment from top trader ratios and funding rates.
     
-    Purpose:
-        From all available assets, select the ones with highest
-        activity scores for full signal generation pipeline.
+    Data Sources:
+        - Top Trader L/S Position Ratio (FREE): Top 20% by margin
+        - Top Trader L/S Account Ratio (FREE): Top 20% accounts
+        - Funding Rate History (Weight: 5): 7-day history
     
-    Selection Criteria:
-        1. Activity score >= min_threshold
-        2. Sufficient liquidity
-        3. Has Options data available
-        4. Not in exclusion list
+    Signal Generation:
+        - Combined score from weighted inputs
+        - Contrarian signals at extreme readings
+    
+    Configuration:
+        ls_extreme_high: 2.0    # Ratio > 2.0 = extreme
+        ls_extreme_low: 0.5     # Ratio < 0.5 = extreme
+        use_contrarian: true    # Generate contrarian signals
     """
     
-    def __init__(self, config: 'Config'):
-        self.config = config
-        self.top_n = config.ranking.top_assets_count          # Default: 5
-        self.min_score = config.ranking.min_activity_score    # Default: 0.30
-        self.excluded = set(config.ranking.excluded_symbols)  # Symbols to skip
+    def __init__(self, config: Dict):
+        self.ls_extreme_high = config.get('ls_extreme_high', 2.0)
+        self.ls_extreme_low = config.get('ls_extreme_low', 0.5)
+        self.use_contrarian = config.get('use_contrarian', True)
+        self.funding_extreme_threshold = config.get('funding_extreme_threshold', 0.001)
+        
+        # Weights for combined score
+        self.weights = config.get('weights', {
+            'position_ratio': 0.40,
+            'account_ratio': 0.30,
+            'funding_rate': 0.30
+        })
     
-    def select(
-        self, 
-        scan_result: ActivityScanResult
-    ) -> List[RankedAsset]:
+    def analyze(
+        self,
+        position_ratio: float,
+        account_ratio: float,
+        funding_rate: float,
+        funding_history: List[Dict]
+    ) -> SentimentResult:
         """
-        Select top assets from scan results.
+        Calculate combined sentiment score.
         
         Returns:
-            List of RankedAsset for detailed analysis
+            SentimentResult with all metrics
         """
-        selected = []
+        # Calculate normalized scores
+        position_score = self._normalize_ratio(position_ratio)
+        account_score = self._normalize_ratio(account_ratio)
+        funding_score = self._normalize_funding(funding_rate, funding_history)
         
-        for rank, symbol in enumerate(scan_result.ranked_symbols, 1):
-            metrics = scan_result.metrics_by_symbol[symbol]
-            
-            # Check criteria
-            if metrics.activity_score < self.min_score:
-                logger.debug(f"{symbol} below threshold: {metrics.activity_score:.2f}")
-                continue
-            
-            if symbol in self.excluded:
-                logger.debug(f"{symbol} in exclusion list")
-                continue
-            
-            if not self._check_liquidity(metrics):
-                logger.debug(f"{symbol} insufficient liquidity")
-                continue
-            
-            # Create ranked asset
-            selected.append(RankedAsset(
-                symbol=symbol,
-                rank=len(selected) + 1,
-                activity_score=metrics.activity_score,
-                primary_driver=metrics.primary_driver,
-                quick_metrics={
-                    'oi_change_pct': metrics.oi_change_pct,
-                    'volume': metrics.total_options_volume,
-                    'iv_percentile': metrics.iv_percentile,
-                    'pcr_extremeness': metrics.pcr_extremeness
-                },
-                selection_reason=f"High {metrics.primary_driver}"
-            ))
-            
-            # Stop at top N
-            if len(selected) >= self.top_n:
-                break
-        
-        logger.info(f"Selected {len(selected)} assets from {scan_result.total_assets_scanned} candidates")
-        return selected
-    
-    def _check_liquidity(self, metrics: ActivityMetrics) -> bool:
-        """Check if asset has sufficient liquidity."""
-        min_volume = self.config.ranking.min_options_volume
-        min_strikes = self.config.ranking.min_active_strikes
-        
-        return (
-            metrics.total_options_volume >= min_volume and
-            metrics.num_strikes_active >= min_strikes
+        # Combined weighted score
+        combined_score = (
+            self.weights['position_ratio'] * position_score +
+            self.weights['account_ratio'] * account_score +
+            self.weights['funding_rate'] * funding_score
         )
+        
+        # Determine signal
+        signal = self._determine_signal(combined_score)
+        
+        # Check for contrarian
+        is_contrarian = self._check_contrarian(position_ratio, account_ratio)
+        
+        # Check funding extreme
+        funding_extreme = abs(funding_rate) > self.funding_extreme_threshold
+        
+        # If contrarian, flip signal
+        if is_contrarian and self.use_contrarian:
+            signal = self._flip_signal(signal)
+        
+        return SentimentResult(
+            position_ratio=position_ratio,
+            account_ratio=account_ratio,
+            funding_rate=funding_rate,
+            funding_rate_avg_7d=self._calc_avg_funding(funding_history),
+            funding_rate_extreme=funding_extreme,
+            combined_score=combined_score,
+            signal=signal,
+            is_contrarian=is_contrarian,
+            timestamp=datetime.utcnow()
+        )
+    
+    def _normalize_ratio(self, ratio: float) -> float:
+        """
+        Normalize L/S ratio to -1 to 1 range.
+        
+        Ratio = 1.0: Neutral
+        Ratio > 1.0: Long bias (positive score)
+        Ratio < 1.0: Short bias (negative score)
+        """
+        if ratio >= 1.0:
+            # Long bias: 1.0 -> 0, 2.0 -> 0.5, 3.0 -> 0.67
+            return min((ratio - 1.0) / 2.0, 1.0)
+        else:
+            # Short bias: 1.0 -> 0, 0.5 -> -0.5, 0.33 -> -0.67
+            return max((ratio - 1.0) / 1.0, -1.0)
+    
+    def _normalize_funding(self, rate: float, history: List[Dict]) -> float:
+        """
+        Normalize funding rate.
+        
+        Positive funding = Longs pay shorts = Bearish pressure
+        Negative funding = Shorts pay longs = Bullish pressure
+        """
+        # Invert: positive funding = bearish, negative = bullish
+        if rate > 0:
+            return -min(rate / self.funding_extreme_threshold, 1.0)
+        else:
+            return min(abs(rate) / self.funding_extreme_threshold, 1.0)
+    
+    def _determine_signal(self, score: float) -> str:
+        """Determine signal from combined score."""
+        if score > 0.2:
+            return SentimentSignal.LONG.value
+        elif score < -0.2:
+            return SentimentSignal.SHORT.value
+        else:
+            return SentimentSignal.NEUTRAL.value
+    
+    def _check_contrarian(self, position_ratio: float, account_ratio: float) -> bool:
+        """Check for contrarian signal conditions."""
+        # Extremely bullish positioning = contrarian SHORT
+        if position_ratio > self.ls_extreme_high or account_ratio > self.ls_extreme_high:
+            return True
+        # Extremely bearish positioning = contrarian LONG
+        if position_ratio < self.ls_extreme_low or account_ratio < self.ls_extreme_low:
+            return True
+        return False
+    
+    def _flip_signal(self, signal: str) -> str:
+        """Flip signal for contrarian."""
+        if signal == SentimentSignal.LONG.value:
+            return SentimentSignal.SHORT.value
+        elif signal == SentimentSignal.SHORT.value:
+            return SentimentSignal.LONG.value
+        return signal
 ```
 
 ---
 
-## 2. Whale Module (NEW)
+## 2. Gamma Exposure Module (NEW)
 
-### 2.1 Whale Detector (`whale/whale_detector.py`)
+### `analysis/gamma_exposure.py`
+
+```python
+# binance_signal_generator/analysis/gamma_exposure.py
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+from enum import Enum
+import math
+import logging
+
+logger = logging.getLogger(__name__)
+
+class GEXRegime(Enum):
+    POSITIVE = "POSITIVE"    # Dealers buy dips, sell rips
+    NEGATIVE = "NEGATIVE"    # Dealers sell dips, buy rips
+    NEUTRAL = "NEUTRAL"
+
+class HedgePressure(Enum):
+    BUY_DIPS = "BUY_DIPS"    # Positive GEX: Dealers support on dips
+    SELL_RIPS = "SELL_RIPS"  # Negative GEX: Dealers accelerate moves
+
+@dataclass
+class GammaLevel:
+    """A gamma-based support/resistance level"""
+    price: float
+    gex: float
+    strength: float
+    type: str  # GAMMA_SUPPORT or GAMMA_RESISTANCE
+
+@dataclass
+class GammaExposureResult:
+    """Result of gamma exposure analysis"""
+    total_gex: float                    # Total gamma exposure
+    gex_regime: str                     # POSITIVE, NEGATIVE, NEUTRAL
+    dealer_hedge_pressure: str          # BUY_DIPS or SELL_RIPS
+    gamma_flip: float                   # Price where GEX flips sign
+    support_levels: List[GammaLevel]    # Gamma-based support
+    resistance_levels: List[GammaLevel] # Gamma-based resistance
+    gamma_risk_score: float             # Normalized risk (0-1)
+    timestamp: datetime
+
+class GammaExposureCalculator:
+    """
+    Calculates dealer gamma exposure from options chain.
+    
+    Formula:
+        GEX = Σ (Gamma × OI × 100 × Spot² × 0.01)
+        
+        For calls: GEX_call = Gamma × OI_call × 100 × Spot² × 0.01
+        For puts: GEX_put = -Gamma × OI_put × 100 × Spot² × 0.01
+    
+    Interpretation:
+        Positive GEX:
+            - Dealers are long gamma
+            - They buy dips, sell rips
+            - Price tends to stabilize
+            - Lower volatility expected
+            
+        Negative GEX:
+            - Dealers are short gamma
+            - They sell dips, buy rips
+            - Price tends to accelerate
+            - Higher volatility expected
+    
+    Configuration:
+        significant_threshold: 0.05   # Min gamma for S/R
+        include_in_sr: true           # Add to S/R levels
+    """
+    
+    def __init__(self, config: Dict):
+        self.significant_threshold = config.get('significant_threshold', 0.05)
+        self.include_in_sr = config.get('include_in_sr', True)
+    
+    def calculate(self, options_chain: 'OptionsChain') -> GammaExposureResult:
+        """
+        Calculate GEX from options chain data.
+        
+        Args:
+            options_chain: Complete options chain with strike data
+            
+        Returns:
+            GammaExposureResult with all GEX metrics
+        """
+        spot = options_chain.spot_price
+        total_gex = 0.0
+        gex_by_strike = {}
+        
+        for strike, data in options_chain.strikes.items():
+            # Calculate GEX for calls (positive)
+            call_gamma = data.call.gamma if data.call.gamma else 0
+            call_oi = data.call.open_interest
+            call_gex = call_gamma * call_oi * 100 * spot * spot * 0.01
+            
+            # Calculate GEX for puts (negative)
+            put_gamma = data.put.gamma if data.put.gamma else 0
+            put_oi = data.put.open_interest
+            put_gex = -put_gamma * put_oi * 100 * spot * spot * 0.01
+            
+            # Total GEX at this strike
+            strike_gex = call_gex + put_gex
+            gex_by_strike[strike] = strike_gex
+            total_gex += strike_gex
+        
+        # Determine regime
+        if total_gex > 0:
+            regime = GEXRegime.POSITIVE
+            hedge_pressure = HedgePressure.BUY_DIPS
+        elif total_gex < 0:
+            regime = GEXRegime.NEGATIVE
+            hedge_pressure = HedgePressure.SELL_RIPS
+        else:
+            regime = GEXRegime.NEUTRAL
+            hedge_pressure = HedgePressure.BUY_DIPS
+        
+        # Find gamma flip level
+        gamma_flip = self._find_gamma_flip(gex_by_strike, spot)
+        
+        # Find gamma-based S/R levels
+        support_levels, resistance_levels = self._find_gamma_levels(
+            gex_by_strike, spot
+        )
+        
+        # Calculate risk score
+        gamma_risk_score = self._calc_risk_score(total_gex)
+        
+        return GammaExposureResult(
+            total_gex=total_gex,
+            gex_regime=regime.value,
+            dealer_hedge_pressure=hedge_pressure.value,
+            gamma_flip=gamma_flip,
+            support_levels=support_levels,
+            resistance_levels=resistance_levels,
+            gamma_risk_score=gamma_risk_score,
+            timestamp=datetime.utcnow()
+        )
+    
+    def _find_gamma_flip(
+        self, 
+        gex_by_strike: Dict[float, float],
+        spot: float
+    ) -> Optional[float]:
+        """
+        Find price level where GEX transitions from positive to negative.
+        """
+        sorted_strikes = sorted(gex_by_strike.keys())
+        
+        for i in range(len(sorted_strikes) - 1):
+            strike1 = sorted_strikes[i]
+            strike2 = sorted_strikes[i + 1]
+            gex1 = gex_by_strike[strike1]
+            gex2 = gex_by_strike[strike2]
+            
+            # Look for sign change
+            if gex1 * gex2 < 0:
+                # Linear interpolation
+                ratio = abs(gex1) / (abs(gex1) + abs(gex2))
+                flip = strike1 + ratio * (strike2 - strike1)
+                return flip
+        
+        return None
+    
+    def _find_gamma_levels(
+        self,
+        gex_by_strike: Dict[float, float],
+        spot: float
+    ) -> Tuple[List[GammaLevel], List[GammaLevel]]:
+        """Find significant gamma levels for S/R."""
+        support = []
+        resistance = []
+        
+        # Find strikes with significant GEX concentration
+        max_abs_gex = max(abs(g) for g in gex_by_strike.values()) if gex_by_strike else 1
+        
+        for strike, gex in gex_by_strike.items():
+            # Normalize significance
+            significance = abs(gex) / max_abs_gex if max_abs_gex > 0 else 0
+            
+            if significance > self.significant_threshold:
+                level = GammaLevel(
+                    price=strike,
+                    gex=gex,
+                    strength=min(significance, 1.0),
+                    type="GAMMA_SUPPORT" if gex > 0 else "GAMMA_RESISTANCE"
+                )
+                
+                if strike < spot:
+                    support.append(level)
+                else:
+                    resistance.append(level)
+        
+        # Sort by distance from spot
+        support.sort(key=lambda x: abs(x.price - spot))
+        resistance.sort(key=lambda x: abs(x.price - spot))
+        
+        return support[:3], resistance[:3]
+    
+    def _calc_risk_score(self, total_gex: float) -> float:
+        """
+        Calculate normalized risk score.
+        
+        Higher absolute GEX = higher risk of volatile moves.
+        """
+        abs_gex = abs(total_gex)
+        
+        # Risk thresholds (in notional terms)
+        low_threshold = 10_000_000_000      # $10B
+        high_threshold = 100_000_000_000    # $100B
+        
+        if abs_gex < low_threshold:
+            return 0.2
+        elif abs_gex > high_threshold:
+            return 1.0
+        else:
+            # Linear interpolation
+            return 0.2 + 0.8 * (abs_gex - low_threshold) / (high_threshold - low_threshold)
+```
+
+---
+
+## 3. Asset-Specific Whale Detection
+
+### `whale/whale_detector.py`
 
 ```python
 # binance_signal_generator/whale/whale_detector.py
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 from enum import Enum
-from collections import defaultdict
 import logging
 
 logger = logging.getLogger(__name__)
@@ -895,1084 +718,331 @@ class WhaleDirection(Enum):
     NEUTRAL = "NEUTRAL"
 
 @dataclass
-class WhaleTrade:
-    """A single whale trade"""
-    trade_id: str
-    timestamp: datetime
-    symbol: str
-    option_type: str          # 'CALL' or 'PUT'
-    strike: float
-    expiry: datetime
-    premium: float            # $ value
-    contracts: int
-    price_per_contract: float
-    direction: str            # 'BUY' or 'SELL'
-    aggressor: str            # Who initiated
-    is_block_trade: bool      # Block trade or regular
-    inferred_sentiment: str   # 'BULLISH' or 'BEARISH'
-
-@dataclass
 class WhaleAnalysis:
     """Aggregated whale activity analysis"""
     symbol: str
     analysis_timestamp: datetime
-    lookback_period: timedelta
     
     # Volume metrics
-    whale_buy_volume: float       # Total bullish whale $ volume
-    whale_sell_volume: float      # Total bearish whale $ volume
-    whale_net_volume: float       # Buy - Sell
+    whale_buy_volume: float
+    whale_sell_volume: float
+    whale_net_volume: float
     
     # Direction
-    whale_net_direction: str      # BULLISH, BEARISH, NEUTRAL
-    whale_activity_score: float   # Normalized 0-1
+    whale_net_direction: str
+    whale_activity_score: float
     
     # Trade stats
-    large_trades_count: int       # Number of whale trades
-    avg_trade_size: float         # Average premium per trade
-    max_single_trade: float       # Largest single trade
+    large_trades_count: int
+    avg_trade_size: float
     
-    # Strike analysis
-    notable_strikes: List[Dict]   # Strikes with whale activity
-    put_heavy_strikes: List[float]  # Strikes with put whale buying
-    call_heavy_strikes: List[float] # Strikes with call whale buying
-    
-    # Signal impact
-    confidence_boost: float       # How much to boost signal confidence
-    signal_alignment: str         # How whale activity aligns with signal
+    # Thresholds used (asset-specific)
+    min_premium: float
+    block_threshold: float
 
 class WhaleDetector:
     """
-    Detects and analyzes whale activity in Options market.
+    Detects whale activity with asset-specific thresholds.
     
-    Whale Definition:
-        - Regular whale: Trade premium > $100,000
-        - Block trade: Trade premium > $500,000
+    Asset Thresholds:
+        BTCUSDT:  $500k min, $2M block
+        ETHUSDT:  $200k min, $1M block
+        Others:   $100k min, $500k block
     
     Purpose:
         Identify large player activity that may indicate
         directional bias and potential price moves.
     """
     
-    def __init__(self, config: 'Config'):
+    ASSET_THRESHOLDS = {
+        'BTCUSDT': {'min_premium': 500000, 'block_threshold': 2000000},
+        'ETHUSDT': {'min_premium': 200000, 'block_threshold': 1000000},
+        'DEFAULT': {'min_premium': 100000, 'block_threshold': 500000}
+    }
+    
+    def __init__(self, config: Dict):
         self.config = config
-        self.whale_threshold = config.whale.min_premium        # $100k
-        self.block_threshold = config.whale.block_threshold    # $500k
-        self.lookback_hours = config.whale.lookback_hours      # 24h default
+        self.lookback_hours = config.get('lookback_hours', 24)
+        
+        # Allow override from config
+        if 'asset_thresholds' in config:
+            self.ASSET_THRESHOLDS.update(config['asset_thresholds'])
+    
+    def get_thresholds(self, symbol: str) -> Dict:
+        """Get thresholds for specific asset."""
+        return self.ASSET_THRESHOLDS.get(
+            symbol,
+            self.ASSET_THRESHOLDS['DEFAULT']
+        )
     
     def analyze(
         self,
         recent_trades: List[dict],
-        options_chain: 'OptionsChain'
+        symbol: str
     ) -> WhaleAnalysis:
         """
         Analyze recent trades for whale activity.
         
-        Args:
-            recent_trades: Recent option trades from API
-            options_chain: Current options chain for context
-        
-        Returns:
-            WhaleAnalysis with all whale metrics
+        Uses asset-specific thresholds for detection.
         """
-        # Parse and filter whale trades
-        whale_trades = []
-        for trade in recent_trades:
-            if trade.get('premium', 0) >= self.whale_threshold:
-                parsed = self._parse_trade(trade, options_chain)
-                whale_trades.append(parsed)
+        # Get thresholds for this asset
+        thresholds = self.get_thresholds(symbol)
+        min_premium = thresholds['min_premium']
+        block_threshold = thresholds['block_threshold']
+        
+        # Filter whale trades
+        whale_trades = [
+            t for t in recent_trades 
+            if self._get_premium(t) >= min_premium
+        ]
         
         if not whale_trades:
-            return self._empty_analysis(options_chain.underlying)
+            return self._empty_analysis(symbol, min_premium, block_threshold)
         
-        # Aggregate volumes by direction
-        buy_volume, sell_volume = 0.0, 0.0
-        call_buy_volume, put_buy_volume = 0.0, 0.0
-        call_sell_volume, put_sell_volume = 0.0, 0.0
-        
-        strike_activity = defaultdict(lambda: {'call': 0.0, 'put': 0.0, 'buy': 0.0, 'sell': 0.0})
-        
-        for trade in whale_trades:
-            # Track by overall direction
-            if trade.inferred_sentiment == 'BULLISH':
-                buy_volume += trade.premium
-            else:
-                sell_volume += trade.premium
-            
-            # Track by option type
-            if trade.option_type == 'CALL':
-                if trade.direction == 'BUY':
-                    call_buy_volume += trade.premium
-                else:
-                    call_sell_volume += trade.premium
-            else:  # PUT
-                if trade.direction == 'BUY':
-                    put_buy_volume += trade.premium
-                else:
-                    put_sell_volume += trade.premium
-            
-            # Track by strike
-            strike_activity[trade.strike][trade.option_type.lower()] += trade.premium
-            strike_activity[trade.strike][trade.direction.lower()] += trade.premium
-        
-        # Calculate net metrics
+        # Aggregate volumes
+        buy_volume = sum(t.get('premium', 0) for t in whale_trades 
+                        if self._is_bullish(t))
+        sell_volume = sum(t.get('premium', 0) for t in whale_trades 
+                         if self._is_bearish(t))
         net_volume = buy_volume - sell_volume
         total_volume = buy_volume + sell_volume
         
         # Determine direction
-        direction = self._determine_direction(net_volume)
+        direction = self._determine_direction(net_volume, min_premium)
         
-        # Calculate activity score
-        activity_score = min(total_volume / 50_000_000, 1.0)  # $50M = max
-        
-        # Find notable strikes
-        notable_strikes = self._find_notable_strikes(strike_activity)
-        call_heavy = [s for s, a in strike_activity.items() 
-                      if a['call'] > a['put'] * 1.5]
-        put_heavy = [s for s, a in strike_activity.items() 
-                     if a['put'] > a['call'] * 1.5]
+        # Activity score (normalized)
+        activity_score = min(total_volume / 50_000_000, 1.0)
         
         return WhaleAnalysis(
-            symbol=options_chain.underlying,
+            symbol=symbol,
             analysis_timestamp=datetime.utcnow(),
-            lookback_period=timedelta(hours=self.lookback_hours),
-            
             whale_buy_volume=buy_volume,
             whale_sell_volume=sell_volume,
             whale_net_volume=net_volume,
-            
             whale_net_direction=direction,
             whale_activity_score=activity_score,
-            
             large_trades_count=len(whale_trades),
-            avg_trade_size=total_volume / len(whale_trades),
-            max_single_trade=max(t.premium for t in whale_trades),
-            
-            notable_strikes=notable_strikes,
-            put_heavy_strikes=put_heavy,
-            call_heavy_strikes=call_heavy,
-            
-            confidence_boost=self._calc_confidence_boost(net_volume, activity_score),
-            signal_alignment=direction
+            avg_trade_size=total_volume / len(whale_trades) if whale_trades else 0,
+            min_premium=min_premium,
+            block_threshold=block_threshold
         )
     
-    def _parse_trade(self, trade: dict, chain: 'OptionsChain') -> WhaleTrade:
-        """Parse raw trade data into WhaleTrade object."""
-        option_type = 'CALL' if 'C' in trade.get('symbol', '') else 'PUT'
-        
-        # Determine if block trade
-        is_block = trade.get('premium', 0) >= self.block_threshold
-        
-        # Infer sentiment from trade
-        # Long call or short put = bullish
-        # Long put or short call = bearish
-        if option_type == 'CALL':
-            sentiment = 'BULLISH' if trade.get('side') == 'BUY' else 'BEARISH'
-        else:
-            sentiment = 'BEARISH' if trade.get('side') == 'BUY' else 'BULLISH'
-        
-        return WhaleTrade(
-            trade_id=trade.get('tradeId', ''),
-            timestamp=datetime.fromtimestamp(trade.get('time', 0) / 1000),
-            symbol=trade.get('symbol', ''),
-            option_type=option_type,
-            strike=trade.get('strike', 0.0),
-            expiry=datetime.fromtimestamp(trade.get('expiry', 0) / 1000),
-            premium=trade.get('premium', 0.0),
-            contracts=trade.get('quantity', 0),
-            price_per_contract=trade.get('price', 0.0),
-            direction=trade.get('side', 'UNKNOWN'),
-            aggressor=trade.get('buyerOrderType', 'UNKNOWN'),
-            is_block_trade=is_block,
-            inferred_sentiment=sentiment
-        )
+    def _get_premium(self, trade: dict) -> float:
+        """Extract premium from trade."""
+        return float(trade.get('quote_qty', trade.get('premium', 0)))
     
-    def _determine_direction(self, net_volume: float) -> str:
-        """Determine whale net direction."""
-        threshold = self.whale_threshold * 2  # $200k net for clear direction
+    def _is_bullish(self, trade: dict) -> bool:
+        """Determine if trade is bullish."""
+        side = trade.get('side', 0)
+        symbol = trade.get('symbol', '')
         
+        # Call buy or put sell = bullish
+        if 'C' in symbol and side == 1:  # Call buy
+            return True
+        if 'P' in symbol and side == -1:  # Put sell
+            return True
+        return False
+    
+    def _is_bearish(self, trade: dict) -> bool:
+        """Determine if trade is bearish."""
+        side = trade.get('side', 0)
+        symbol = trade.get('symbol', '')
+        
+        # Put buy or call sell = bearish
+        if 'P' in symbol and side == 1:  # Put buy
+            return True
+        if 'C' in symbol and side == -1:  # Call sell
+            return True
+        return False
+    
+    def _determine_direction(self, net_volume: float, threshold: float) -> str:
+        """Determine whale direction."""
         if net_volume > threshold:
-            return 'BULLISH'
+            return WhaleDirection.BULLISH.value
         elif net_volume < -threshold:
-            return 'BEARISH'
-        else:
-            return 'NEUTRAL'
+            return WhaleDirection.BEARISH.value
+        return WhaleDirection.NEUTRAL.value
     
-    def _find_notable_strikes(self, strike_activity: dict) -> List[Dict]:
-        """Find strikes with significant whale activity."""
-        notable = []
-        for strike, activity in strike_activity.items():
-            total = activity['call'] + activity['put']
-            if total >= 1_000_000:  # $1M+ at strike
-                notable.append({
-                    'strike': strike,
-                    'total_volume': total,
-                    'call_volume': activity['call'],
-                    'put_volume': activity['put'],
-                    'net_bias': 'CALL' if activity['call'] > activity['put'] else 'PUT'
-                })
-        
-        return sorted(notable, key=lambda x: x['total_volume'], reverse=True)[:5]
-    
-    def _calc_confidence_boost(self, net_volume: float, activity_score: float) -> float:
-        """
-        Calculate how much whale activity should boost signal confidence.
-        
-        Max boost: 0.15 (15 percentage points)
-        """
-        # Strong net direction + high activity = max boost
-        normalized_net = min(abs(net_volume) / 20_000_000, 1.0)  # $20M net = max
-        return 0.15 * normalized_net * activity_score
-    
-    def _empty_analysis(self, symbol: str) -> WhaleAnalysis:
+    def _empty_analysis(self, symbol: str, min_premium: float, block_threshold: float) -> WhaleAnalysis:
         """Return empty analysis when no whale activity."""
         return WhaleAnalysis(
             symbol=symbol,
             analysis_timestamp=datetime.utcnow(),
-            lookback_period=timedelta(hours=self.lookback_hours),
             whale_buy_volume=0.0,
             whale_sell_volume=0.0,
             whale_net_volume=0.0,
-            whale_net_direction='NEUTRAL',
+            whale_net_direction=WhaleDirection.NEUTRAL.value,
             whale_activity_score=0.0,
             large_trades_count=0,
             avg_trade_size=0.0,
-            max_single_trade=0.0,
-            notable_strikes=[],
-            put_heavy_strikes=[],
-            call_heavy_strikes=[],
-            confidence_boost=0.0,
-            signal_alignment='NEUTRAL'
+            min_premium=min_premium,
+            block_threshold=block_threshold
         )
 ```
 
 ---
 
-## 3. Wall Detector Module (NEW)
+## 4. Signal Scorer Module
 
-### 3.1 Wall Detector (`analysis/wall_detector.py`)
+### `analysis/signal_scorer.py`
 
 ```python
-# binance_signal_generator/analysis/wall_detector.py
+# binance_signal_generator/analysis/signal_scorer.py
 
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, Optional
 from enum import Enum
 import logging
 
 logger = logging.getLogger(__name__)
 
-class WallType(Enum):
-    CALL_WALL = "CALL_WALL"     # Resistance
-    PUT_WALL = "PUT_WALL"       # Support
-    GAMMA_WALL = "GAMMA_WALL"   # High gamma concentration
+class SignalDirection(Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+    NEUTRAL = "NEUTRAL"
+
+class SignalStrength(Enum):
+    WEAK = "WEAK"
+    MODERATE = "MODERATE"
+    STRONG = "STRONG"
+    VERY_STRONG = "VERY_STRONG"
 
 @dataclass
-class OptionWall:
-    """An Options wall (large OI concentration)"""
-    strike: float
-    wall_type: str              # 'CALL_WALL' or 'PUT_WALL'
-    
-    # OI metrics
-    open_interest: int
-    oi_percentage: float        # % of total OI
-    oi_change_24h: float        # Change in last 24h
-    
-    # Volume metrics
-    volume: int
-    volume_vs_avg: float        # Volume vs 7-day avg
-    
-    # Position
-    distance_from_spot: float   # Distance in %
-    side: str                   # 'ABOVE' or 'BELOW' spot
-    
-    # Strength
-    strength_score: float       # 0-1 overall strength
-    is_major_wall: bool         # Top OI strike for type
-    
-    # Whale activity
-    whale_volume_at_strike: float
-    whale_sentiment: str        # Net whale direction at strike
+class SignalComponents:
+    """Individual signal components"""
+    iv: str           # LONG, SHORT, NEUTRAL
+    iv_score: float   # Confidence 0-1
+    pcr: str
+    pcr_score: float
+    oi: str
+    oi_score: float
+    max_pain: str
+    max_pain_score: float
+    sentiment: str    # NEW
+    sentiment_score: float  # NEW
 
 @dataclass
-class WallAnalysis:
-    """Complete wall analysis for an asset"""
-    symbol: str
-    spot_price: float
-    timestamp: 'datetime'
-    
-    # Walls by type
-    put_walls: List[OptionWall]       # Support levels
-    call_walls: List[OptionWall]      # Resistance levels
-    
-    # Key walls
-    strongest_put_wall: Optional[OptionWall]
-    strongest_call_wall: Optional[OptionWall]
-    nearest_put_wall: Optional[OptionWall]
-    nearest_call_wall: Optional[OptionWall]
-    
-    # Overall metrics
-    total_walls: int
-    wall_intensity: float        # How concentrated is OI
-    wall_imbalance: float        # Call walls vs Put walls strength
-    
-    # Trading levels
-    support_levels: List[float]   # Sorted put wall strikes
-    resistance_levels: List[float]  # Sorted call wall strikes
-
-class WallDetector:
-    """
-    Detects Options walls for support/resistance identification.
-    
-    Wall Definition:
-        Strike with Open Interest >= 15% of total OI
-    
-    Purpose:
-        Identify key price levels where market has concentrated
-        option positions, which often act as support/resistance.
-    
-    Output:
-        2-3 levels of support and resistance for signal generation
-    """
-    
-    def __init__(self, config: 'Config'):
-        self.config = config
-        self.wall_threshold = config.walls.min_oi_percentage   # 0.15
-        self.max_walls = config.walls.max_levels               # 3
-        self.major_wall_threshold = config.walls.major_threshold  # 0.25
-    
-    def detect(
-        self,
-        options_chain: 'OptionsChain',
-        whale_analysis: Optional['WhaleAnalysis'] = None
-    ) -> WallAnalysis:
-        """
-        Detect put and call walls from OI distribution.
-        
-        Args:
-            options_chain: Full options chain data
-            whale_analysis: Optional whale data for enrichment
-        
-        Returns:
-            WallAnalysis with all detected walls
-        """
-        spot = options_chain.spot_price
-        
-        # Calculate total OI
-        total_call_oi = sum(s.call.open_interest for s in options_chain.strikes.values())
-        total_put_oi = sum(s.put.open_interest for s in options_chain.strikes.values())
-        total_oi = total_call_oi + total_put_oi
-        
-        # Find walls
-        put_walls = []
-        call_walls = []
-        
-        for strike, data in options_chain.strikes.items():
-            call_oi = data.call.open_interest
-            put_oi = data.put.open_interest
-            
-            # Check for call wall (resistance - above spot)
-            call_pct = call_oi / total_oi
-            if call_pct >= self.wall_threshold and strike > spot:
-                call_walls.append(self._build_wall(
-                    strike=strike,
-                    wall_type='CALL_WALL',
-                    oi=call_oi,
-                    oi_pct=call_pct,
-                    volume=data.call.volume,
-                    spot=spot,
-                    total_oi=total_oi,
-                    whale_analysis=whale_analysis
-                ))
-            
-            # Check for put wall (support - below spot)
-            put_pct = put_oi / total_oi
-            if put_pct >= self.wall_threshold and strike < spot:
-                put_walls.append(self._build_wall(
-                    strike=strike,
-                    wall_type='PUT_WALL',
-                    oi=put_oi,
-                    oi_pct=put_pct,
-                    volume=data.put.volume,
-                    spot=spot,
-                    total_oi=total_oi,
-                    whale_analysis=whale_analysis
-                ))
-        
-        # Sort by strength
-        put_walls.sort(key=lambda w: w.strength_score, reverse=True)
-        call_walls.sort(key=lambda w: w.strength_score, reverse=True)
-        
-        # Also sort by distance for nearest
-        put_by_distance = sorted(put_walls, key=lambda w: abs(w.distance_from_spot))
-        call_by_distance = sorted(call_walls, key=lambda w: abs(w.distance_from_spot))
-        
-        # Limit to max walls
-        put_walls = put_walls[:self.max_walls]
-        call_walls = call_walls[:self.max_walls]
-        
-        return WallAnalysis(
-            symbol=options_chain.underlying,
-            spot_price=spot,
-            timestamp=datetime.utcnow(),
-            
-            put_walls=put_walls,
-            call_walls=call_walls,
-            
-            strongest_put_wall=put_walls[0] if put_walls else None,
-            strongest_call_wall=call_walls[0] if call_walls else None,
-            nearest_put_wall=put_by_distance[0] if put_by_distance else None,
-            nearest_call_wall=call_by_distance[0] if call_by_distance else None,
-            
-            total_walls=len(put_walls) + len(call_walls),
-            wall_intensity=self._calc_intensity(put_walls + call_walls, total_oi),
-            wall_imbalance=self._calc_imbalance(put_walls, call_walls),
-            
-            support_levels=[w.strike for w in sorted(put_walls, key=lambda w: -w.strike)],
-            resistance_levels=[w.strike for w in sorted(call_walls, key=lambda w: w.strike)]
-        )
-    
-    def _build_wall(
-        self,
-        strike: float,
-        wall_type: str,
-        oi: int,
-        oi_pct: float,
-        volume: int,
-        spot: float,
-        total_oi: int,
-        whale_analysis: Optional['WhaleAnalysis']
-    ) -> OptionWall:
-        """Build OptionWall object with all metrics."""
-        distance = abs(strike - spot) / spot * 100
-        side = 'ABOVE' if strike > spot else 'BELOW'
-        
-        # Calculate strength
-        strength = self._calc_wall_strength(oi_pct, distance, volume)
-        
-        # Check if major wall
-        is_major = oi_pct >= self.major_wall_threshold
-        
-        # Get whale activity if available
-        whale_vol = 0.0
-        whale_sentiment = 'NEUTRAL'
-        if whale_analysis:
-            for notable in whale_analysis.notable_strikes:
-                if notable['strike'] == strike:
-                    whale_vol = notable['total_volume']
-                    whale_sentiment = notable['net_bias']
-        
-        return OptionWall(
-            strike=strike,
-            wall_type=wall_type,
-            open_interest=oi,
-            oi_percentage=oi_pct,
-            oi_change_24h=0.0,  # Would need historical data
-            volume=volume,
-            volume_vs_avg=1.0,  # Would need historical data
-            distance_from_spot=distance,
-            side=side,
-            strength_score=strength,
-            is_major_wall=is_major,
-            whale_volume_at_strike=whale_vol,
-            whale_sentiment=whale_sentiment
-        )
-    
-    def _calc_wall_strength(self, oi_pct: float, distance: float, volume: int) -> float:
-        """
-        Calculate wall strength score (0-1).
-        
-        Factors:
-        - OI concentration (primary)
-        - Proximity to spot (closer = stronger)
-        - Volume activity
-        """
-        # OI concentration factor
-        oi_factor = min(oi_pct / 0.30, 1.0)  # 30% = max
-        
-        # Distance factor (closer = stronger)
-        # Within 1% = 1.0, at 10% = 0.0
-        distance_factor = max(0, 1 - distance / 10.0)
-        
-        # Combine with weights
-        return oi_factor * 0.7 + distance_factor * 0.3
-    
-    def _calc_intensity(self, walls: List[OptionWall], total_oi: int) -> float:
-        """Calculate overall wall intensity (how concentrated is OI)."""
-        if not walls:
-            return 0.0
-        
-        wall_oi = sum(w.open_interest for w in walls)
-        return wall_oi / total_oi
-    
-    def _calc_imbalance(self, put_walls: List[OptionWall], call_walls: List[OptionWall]) -> float:
-        """
-        Calculate wall imbalance.
-        
-        Positive = More call walls (resistance stronger)
-        Negative = More put walls (support stronger)
-        """
-        put_strength = sum(w.strength_score for w in put_walls)
-        call_strength = sum(w.strength_score for w in call_walls)
-        
-        total = put_strength + call_strength
-        if total == 0:
-            return 0.0
-        
-        return (call_strength - put_strength) / total
-```
-
----
-
-## 4. S/R Levels Module (NEW)
-
-### 4.1 S/R Level Calculator (`output/sr_levels.py`)
-
-```python
-# binance_signal_generator/output/sr_levels.py
-
-from dataclasses import dataclass
-from typing import List, Optional, Dict
-from enum import Enum
-
-class LevelType(Enum):
-    PUT_WALL = "PUT_WALL"
-    CALL_WALL = "CALL_WALL"
-    MAX_PAIN = "MAX_PAIN"
-    WHALE_CLUSTER = "WHALE_CLUSTER"
-
-@dataclass
-class SRLevel:
-    """Single support or resistance level"""
-    level: int                  # 1, 2, or 3
-    price: float
-    type: str                   # Level type
-    strength: float             # 0-1
-    confidence: float           # How confident we are in this level
-    source: str                 # Human-readable description
-    wall_data: Optional[Dict]   # Raw wall data if applicable
-
-@dataclass
-class SRLevels:
-    """Complete support/resistance structure"""
-    # Support levels (below current price)
-    support: List[SRLevel]
-    
-    # Resistance levels (above current price)
-    resistance: List[SRLevel]
-    
-    # Risk levels for signal
-    stop_loss: Optional[SRLevel]
-    take_profit_levels: List[SRLevel]
-    
-    # Risk metrics
-    risk_reward_ratio: float
-    stop_distance_pct: float
-    avg_tp_distance_pct: float
-
-class SRLevelCalculator:
-    """
-    Calculates support/resistance levels from detected walls.
-    
-    Purpose:
-        Convert wall analysis into actionable S/R levels
-        for signal generation and risk management.
-    
-    Output:
-        2-3 support and resistance levels with:
-        - Price
-        - Strength/confidence
-        - Source (which wall, max pain, etc.)
-    """
-    
-    def __init__(self, config: 'Config'):
-        self.config = config
-        self.max_levels = 3
-    
-    def calculate(
-        self,
-        wall_analysis: 'WallAnalysis',
-        max_pain_strike: float,
-        spot_price: float,
-        direction: 'SignalDirection'
-    ) -> SRLevels:
-        """
-        Calculate S/R levels from walls and max pain.
-        
-        Args:
-            wall_analysis: Detected walls
-            max_pain_strike: Max pain strike
-            spot_price: Current price
-            direction: Signal direction (LONG/SHORT)
-        
-        Returns:
-            SRLevels with support, resistance, SL, and TPs
-        """
-        # Build support levels (below spot)
-        support = self._build_support_levels(
-            wall_analysis.put_walls,
-            max_pain_strike,
-            spot_price
-        )
-        
-        # Build resistance levels (above spot)
-        resistance = self._build_resistance_levels(
-            wall_analysis.call_walls,
-            spot_price
-        )
-        
-        # Determine stop loss
-        stop_loss = self._determine_stop_loss(
-            support if direction == 'LONG' else resistance,
-            direction
-        )
-        
-        # Determine take profits
-        take_profits = self._determine_take_profits(
-            resistance if direction == 'LONG' else support,
-            spot_price
-        )
-        
-        # Calculate risk metrics
-        risk_reward = self._calc_risk_reward(spot_price, stop_loss, take_profits)
-        stop_dist = self._calc_stop_distance(spot_price, stop_loss)
-        avg_tp_dist = self._calc_avg_tp_distance(spot_price, take_profits)
-        
-        return SRLevels(
-            support=support,
-            resistance=resistance,
-            stop_loss=stop_loss,
-            take_profit_levels=take_profits,
-            risk_reward_ratio=risk_reward,
-            stop_distance_pct=stop_dist,
-            avg_tp_distance_pct=avg_tp_dist
-        )
-    
-    def _build_support_levels(
-        self,
-        put_walls: List['OptionWall'],
-        max_pain: float,
-        spot: float
-    ) -> List[SRLevel]:
-        """Build support levels from put walls and max pain."""
-        support = []
-        
-        # Add put walls
-        for i, wall in enumerate(sorted(put_walls, key=lambda w: -w.strike)[:self.max_levels], 1):
-            support.append(SRLevel(
-                level=i,
-                price=wall.strike,
-                type='PUT_WALL',
-                strength=wall.strength_score,
-                confidence=wall.strength_score * 0.9,
-                source=f"Put Wall @ {wall.strike:.2f} ({wall.oi_percentage:.1%} OI)",
-                wall_data={
-                    'strike': wall.strike,
-                    'oi': wall.open_interest,
-                    'oi_pct': wall.oi_percentage,
-                    'whale_volume': wall.whale_volume_at_strike
-                }
-            ))
-        
-        # Add max pain if below spot and not already included
-        if max_pain < spot and max_pain > 0:
-            max_pain_dist = (spot - max_pain) / spot * 100
-            if max_pain_dist > 0.5:  # Only add if meaningful distance
-                support.append(SRLevel(
-                    level=len(support) + 1,
-                    price=max_pain,
-                    type='MAX_PAIN',
-                    strength=0.65,
-                    confidence=0.60,
-                    source=f"Max Pain @ {max_pain:.2f}",
-                    wall_data={'strike': max_pain}
-                ))
-        
-        # Sort by proximity to spot (nearest first)
-        support.sort(key=lambda s: abs(s.price - spot))
-        
-        # Re-number levels
-        for i, level in enumerate(support, 1):
-            level.level = i
-        
-        return support
-    
-    def _build_resistance_levels(
-        self,
-        call_walls: List['OptionWall'],
-        spot: float
-    ) -> List[SRLevel]:
-        """Build resistance levels from call walls."""
-        resistance = []
-        
-        for i, wall in enumerate(sorted(call_walls, key=lambda w: w.strike)[:self.max_levels], 1):
-            resistance.append(SRLevel(
-                level=i,
-                price=wall.strike,
-                type='CALL_WALL',
-                strength=wall.strength_score,
-                confidence=wall.strength_score * 0.9,
-                source=f"Call Wall @ {wall.strike:.2f} ({wall.oi_percentage:.1%} OI)",
-                wall_data={
-                    'strike': wall.strike,
-                    'oi': wall.open_interest,
-                    'oi_pct': wall.oi_percentage,
-                    'whale_volume': wall.whale_volume_at_strike
-                }
-            ))
-        
-        return resistance
-    
-    def _determine_stop_loss(
-        self,
-        levels: List[SRLevel],
-        direction: 'SignalDirection'
-    ) -> Optional[SRLevel]:
-        """
-        Determine which level to use for stop loss.
-        
-        For LONG: Use nearest support (S1)
-        For SHORT: Use nearest resistance (R1)
-        """
-        if not levels:
-            return None
-        
-        # Use nearest level (first in list)
-        return levels[0]
-    
-    def _determine_take_profits(
-        self,
-        levels: List[SRLevel],
-        spot: float
-    ) -> List[SRLevel]:
-        """
-        Determine take profit levels.
-        
-        Use up to 3 levels with position split:
-        - TP1: 50% of position
-        - TP2: 30% of position
-        - TP3: 20% of position
-        """
-        return levels[:3]
-    
-    def _calc_risk_reward(
-        self,
-        spot: float,
-        stop_loss: Optional[SRLevel],
-        take_profits: List[SRLevel]
-    ) -> float:
-        """Calculate risk/reward ratio."""
-        if not stop_loss or not take_profits:
-            return 0.0
-        
-        risk = abs(spot - stop_loss.price)
-        if risk == 0:
-            return 0.0
-        
-        # Weighted average TP
-        weights = [0.5, 0.3, 0.2]
-        reward = sum(
-            abs(tp.price - spot) * weights[i]
-            for i, tp in enumerate(take_profits)
-            if i < len(weights)
-        )
-        
-        return reward / risk
-    
-    def _calc_stop_distance(self, spot: float, stop_loss: Optional[SRLevel]) -> float:
-        """Calculate stop loss distance as % of spot."""
-        if not stop_loss:
-            return 0.0
-        return abs(stop_loss.price - spot) / spot * 100
-    
-    def _calc_avg_tp_distance(self, spot: float, take_profits: List[SRLevel]) -> float:
-        """Calculate average take profit distance as % of spot."""
-        if not take_profits:
-            return 0.0
-        
-        weights = [0.5, 0.3, 0.2]
-        total_weight = sum(weights[:len(take_profits)])
-        
-        return sum(
-            abs(tp.price - spot) / spot * 100 * weights[i]
-            for i, tp in enumerate(take_profits)
-            if i < len(weights)
-        ) / total_weight
-```
-
----
-
-## 5. Signal Generator (Updated)
-
-### 5.1 Signal Generator (`output/signal_generator.py`)
-
-```python
-# binance_signal_generator/output/signal_generator.py
-
-from dataclasses import dataclass, asdict
-from datetime import datetime
-from typing import List, Optional, Dict
-import json
-
-@dataclass
-class EntryZone:
-    min_price: float
-    max_price: float
-    ideal_price: float
-
-@dataclass
-class TakeProfitLevel:
-    level: int
-    price: float
-    ratio: float             # Position ratio to close
-    wall_type: str           # Which wall this TP is based on
-    wall_strike: float
-
-@dataclass
-class TradingSignal:
-    # Identity
-    signal_id: str
-    timestamp: datetime
-    symbol: str
-    asset_rank: int
-    activity_score: float
-    
-    # Direction
+class SignalResult:
+    """Final signal result"""
     direction: str
-    confidence_score: float
-    signal_strength: str      # STRONG, MODERATE, WEAK
-    
-    # Entry
-    entry_zone: EntryZone
-    
-    # Risk Management
-    stop_loss: float
-    stop_loss_type: str       # WALL_BASED
-    stop_loss_wall: Dict      # Which wall SL is based on
-    
-    # Take Profits
-    take_profit_levels: List[TakeProfitLevel]
-    
-    # Support/Resistance
-    support_levels: List[Dict]
-    resistance_levels: List[Dict]
-    
-    # Whale Metrics
-    whale_metrics: Dict
-    
-    # Options Metrics
-    options_metrics: Dict
-    
-    # Futures Metrics
-    futures_metrics: Dict
+    confidence: float
+    raw_score: float
+    strength: str
+    components: SignalComponents
 
-class SignalGenerator:
+class SignalScorer:
     """
-    Generates final trading signals with all components.
+    Combines all analyzer outputs into unified signal.
     
-    Output includes:
-    - Entry zone
-    - Stop loss from nearest wall
-    - Multiple take profits from resistance/support walls
-    - Support/resistance levels (2-3 each)
-    - Whale activity metrics
+    Weights (configurable):
+        iv: 0.20
+        pcr: 0.25
+        oi: 0.20
+        max_pain: 0.15
+        sentiment: 0.20    # NEW
     """
     
-    def generate(
+    DEFAULT_WEIGHTS = {
+        'iv': 0.20,
+        'pcr': 0.25,
+        'oi': 0.20,
+        'max_pain': 0.15,
+        'sentiment': 0.20
+    }
+    
+    def __init__(self, config: Dict):
+        self.weights = config.get('weights', self.DEFAULT_WEIGHTS)
+    
+    def score(
         self,
-        asset: 'RankedAsset',
-        options_signal: 'OptionsSignal',
-        whale_analysis: 'WhaleAnalysis',
-        wall_analysis: 'WallAnalysis',
-        sr_levels: 'SRLevels',
-        futures_data: 'FuturesData',
-        validation: 'ValidationResult'
-    ) -> Optional[TradingSignal]:
+        iv_result: Dict,
+        pcr_result: Dict,
+        oi_result: Dict,
+        max_pain_result: Dict,
+        sentiment_result: Dict  # NEW
+    ) -> SignalResult:
         """
-        Generate complete trading signal.
+        Calculate combined signal score.
         """
-        if not sr_levels.stop_loss:
-            logger.warning(f"No stop loss level for {asset.symbol}")
-            return None
+        directional_score = 0.0
         
-        # Entry zone
-        entry = self._calc_entry_zone(
-            futures_data.price,
-            options_signal.direction,
-            sr_levels
+        # Process each analyzer
+        components = SignalComponents(
+            iv=iv_result.get('signal', 'NEUTRAL'),
+            iv_score=iv_result.get('score', 0.5),
+            pcr=pcr_result.get('signal', 'NEUTRAL'),
+            pcr_score=pcr_result.get('score', 0.5),
+            oi=oi_result.get('signal', 'NEUTRAL'),
+            oi_score=oi_result.get('score', 0.5),
+            max_pain=max_pain_result.get('signal', 'NEUTRAL'),
+            max_pain_score=max_pain_result.get('score', 0.5),
+            sentiment=sentiment_result.get('signal', 'NEUTRAL'),
+            sentiment_score=sentiment_result.get('combined_score', 0.0)
         )
         
-        # Take profits
-        take_profits = self._build_take_profits(sr_levels)
+        # Calculate weighted score
+        for name, result in [
+            ('iv', iv_result),
+            ('pcr', pcr_result),
+            ('oi', oi_result),
+            ('max_pain', max_pain_result),
+            ('sentiment', sentiment_result)
+        ]:
+            weight = self.weights.get(name, 0)
+            signal = result.get('signal', 'NEUTRAL')
+            score = result.get('score', result.get('combined_score', 0.5))
+            
+            if signal == 'LONG':
+                directional_score += weight * score
+            elif signal == 'SHORT':
+                directional_score -= weight * score
         
-        # Calculate final confidence with whale boost
-        final_confidence = min(
-            options_signal.confidence + whale_analysis.confidence_boost,
-            1.0
-        )
+        # Determine final direction
+        if directional_score > 0.30:
+            direction = SignalDirection.LONG.value
+        elif directional_score < -0.30:
+            direction = SignalDirection.SHORT.value
+        else:
+            direction = SignalDirection.NEUTRAL.value
+        
+        # Calculate confidence
+        confidence = min(abs(directional_score), 1.0)
         
         # Determine strength
-        strength = self._determine_strength(final_confidence)
+        strength = self._determine_strength(confidence)
         
-        return TradingSignal(
-            signal_id=self._generate_id(asset.symbol, options_signal.direction),
-            timestamp=datetime.utcnow(),
-            symbol=asset.symbol,
-            asset_rank=asset.rank,
-            activity_score=asset.activity_score,
-            
-            direction=options_signal.direction.value,
-            confidence_score=final_confidence,
-            signal_strength=strength,
-            
-            entry_zone=entry,
-            
-            stop_loss=sr_levels.stop_loss.price,
-            stop_loss_type='WALL_BASED',
-            stop_loss_wall=sr_levels.stop_loss.wall_data or {},
-            
-            take_profit_levels=take_profits,
-            
-            support_levels=[self._sr_to_dict(s) for s in sr_levels.support],
-            resistance_levels=[self._sr_to_dict(r) for r in sr_levels.resistance],
-            
-            whale_metrics={
-                'whale_buy_volume': whale_analysis.whale_buy_volume,
-                'whale_sell_volume': whale_analysis.whale_sell_volume,
-                'whale_net_volume': whale_analysis.whale_net_volume,
-                'whale_net_direction': whale_analysis.whale_net_direction,
-                'whale_activity_score': whale_analysis.whale_activity_score,
-                'large_trades_count': whale_analysis.large_trades_count,
-                'avg_trade_size': whale_analysis.avg_trade_size
-            },
-            
-            options_metrics=options_signal.to_dict(),
-            
-            futures_metrics={
-                'price': futures_data.price,
-                'volume_24h': futures_data.volume_24h,
-                'open_interest': futures_data.open_interest,
-                'funding_rate': futures_data.funding_rate,
-                'trend': validation.trend.value,
-                'volatility_state': validation.volatility_state.value
-            }
+        return SignalResult(
+            direction=direction,
+            confidence=confidence,
+            raw_score=directional_score,
+            strength=strength,
+            components=components
         )
-    
-    def _calc_entry_zone(
-        self,
-        current_price: float,
-        direction: str,
-        sr_levels: SRLevels
-    ) -> EntryZone:
-        """Calculate entry zone based on current price and S/R."""
-        # For LONG: Entry zone is slightly above support
-        # For SHORT: Entry zone is slightly below resistance
-        
-        if direction == 'LONG':
-            # Entry between current and just above nearest support
-            support_price = sr_levels.support[0].price if sr_levels.support else current_price * 0.99
-            min_entry = max(support_price, current_price * 0.998)
-            max_entry = current_price * 1.002
-            ideal = (min_entry + max_entry) / 2
-        else:
-            # Entry between current and just below nearest resistance
-            resistance_price = sr_levels.resistance[0].price if sr_levels.resistance else current_price * 1.01
-            max_entry = min(resistance_price, current_price * 1.002)
-            min_entry = current_price * 0.998
-            ideal = (min_entry + max_entry) / 2
-        
-        return EntryZone(
-            min_price=min_entry,
-            max_price=max_entry,
-            ideal_price=ideal
-        )
-    
-    def _build_take_profits(self, sr_levels: SRLevels) -> List[TakeProfitLevel]:
-        """Build take profit levels from S/R."""
-        ratios = [0.5, 0.3, 0.2]  # Position split
-        
-        tps = []
-        for i, level in enumerate(sr_levels.take_profit_levels):
-            if i >= len(ratios):
-                break
-            
-            tps.append(TakeProfitLevel(
-                level=i + 1,
-                price=level.price,
-                ratio=ratios[i],
-                wall_type=level.type,
-                wall_strike=level.price
-            ))
-        
-        return tps
     
     def _determine_strength(self, confidence: float) -> str:
-        """Determine signal strength label."""
-        if confidence >= 0.75:
-            return 'STRONG'
-        elif confidence >= 0.55:
-            return 'MODERATE'
+        """Determine signal strength from confidence."""
+        if confidence >= 0.80:
+            return SignalStrength.VERY_STRONG.value
+        elif confidence >= 0.65:
+            return SignalStrength.STRONG.value
+        elif confidence >= 0.50:
+            return SignalStrength.MODERATE.value
         else:
-            return 'WEAK'
-    
-    def _generate_id(self, symbol: str, direction: str) -> str:
-        """Generate unique signal ID."""
-        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M')
-        return f"SIG_{timestamp}_{symbol}_{direction.value}"
-    
-    def _sr_to_dict(self, level: SRLevel) -> dict:
-        """Convert SRLevel to dictionary."""
-        return {
-            'level': level.level,
-            'price': level.price,
-            'type': level.type,
-            'strength': level.strength,
-            'source': level.source
-        }
+            return SignalStrength.WEAK.value
 ```
 
 ---
 
-## Module Dependencies
+## Module Integration Summary
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    MODULE DEPENDENCY GRAPH                         │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  cli.py                                                            │
-│     │                                                               │
-│     └── pipeline/orchestrator.py                                   │
-│              │                                                      │
-│              ├── ranking/activity_scorer.py                        │
-│              │        └── data/options_fetcher.py                  │
-│              │                                                      │
-│              ├── ranking/asset_selector.py                         │
-│              │        └── ranking/activity_scorer.py               │
-│              │                                                      │
-│              ├── data/options_fetcher.py                           │
-│              ├── data/futures_fetcher.py                           │
-│              │                                                      │
-│              ├── analysis/* (all analyzers)                        │
-│              │        └── data/options_fetcher.py                  │
-│              │                                                      │
-│              ├── analysis/wall_detector.py                         │
-│              │        └── whale/whale_detector.py                  │
-│              │                                                      │
-│              ├── whale/whale_detector.py                           │
-│              │        └── data/options_fetcher.py                  │
-│              │                                                      │
-│              ├── output/sr_levels.py                                │
-│              │        └── analysis/wall_detector.py                │
-│              │                                                      │
-│              ├── output/signal_generator.py                        │
-│              │        ├── output/sr_levels.py                       │
-│              │        ├── whale/whale_detector.py                  │
-│              │        └── ranking/asset_selector.py                │
-│              │                                                      │
-│              └── output/database.py                                 │
-│                                                                      │
-│  config/loader.py ──────────► (all modules)                        │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+| Module | Input | Output | Weight |
+|--------|-------|--------|--------|
+| `iv_analyzer.py` | Options IV data | IV signal, percentile | 0.20 |
+| `pcr_analyzer.py` | Put/Call OI & Volume | PCR signal, ratio | 0.25 |
+| `oi_analyzer.py` | OI distribution | OI signal, concentration | 0.20 |
+| `max_pain.py` | All strikes | Max pain price, distance | 0.15 |
+| `sentiment.py` (NEW) | L/S ratios, Funding | Sentiment signal, score | 0.20 |
+| `gamma_exposure.py` (NEW) | Options chain | GEX, flip level, S/R | - |
+| `whale_detector.py` | Block trades | Whale activity, direction | - |
+| `wall_detector.py` | OI at strikes | Support/Resistance levels | - |
+| `signal_scorer.py` | All above | Final signal | - |

@@ -4,7 +4,7 @@ A production-ready Python package that generates **intraday trading signals** fo
 
 ## Overview
 
-This system operates on a **15-minute scheduled execution** cycle, automatically selecting the **top 5 assets** based on Options activity ranking, then analyzing Options market data to derive actionable insights for Futures trading decisions. It produces trading signals with **multi-level support/resistance (from Options walls)** and defined risk parameters.
+This system operates on a **15-minute scheduled execution** cycle, automatically selecting the **top 5 assets** based on Options activity ranking, then analyzing Options market data to derive actionable insights for Futures trading decisions. It produces trading signals with **multi-level support/resistance (from Options walls and Gamma levels)** and defined risk parameters.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -14,13 +14,14 @@ This system operates on a **15-minute scheduled execution** cycle, automatically
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐          │
 │  │   OPTIONS    │    │   ASSET      │    │   WHALE      │          │
 │  │  ACTIVITY    │───▶│   RANKING    │───▶│  DETECTION   │          │
-│  │   SCAN       │    │  (Top 5)     │    │              │          │
+│  │   SCAN       │    │  (Top 5)     │    │ (Asset-Spec) │          │
 │  └──────────────┘    └──────────────┘    └──────────────┘          │
 │         │                   │                   │                   │
 │         ▼                   ▼                   ▼                   │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐          │
 │  │  IV / PCR /  │    │  Signal      │    │  S/R Levels  │          │
 │  │  OI / Walls  │    │  Generation  │    │  (2-3 Level) │          │
+│  │  GEX / Sent. │    │              │    │  + Gamma S/R │          │
 │  └──────────────┘    └──────────────┘    └──────────────┘          │
 │                                                 │                   │
 │                                                 ▼                   │
@@ -30,6 +31,8 @@ This system operates on a **15-minute scheduled execution** cycle, automatically
 │                                    │   • Support (2-3)    │        │
 │                                    │   • Resistance (2-3) │        │
 │                                    │   • Whale Metrics    │        │
+│                                    │   • Gamma Exposure   │        │
+│                                    │   • Sentiment Score  │        │
 │                                    └──────────────────────┘        │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -39,13 +42,43 @@ This system operates on a **15-minute scheduled execution** cycle, automatically
 | Feature | Description |
 |---------|-------------|
 | **Adaptive Asset Selection** | Automatically selects top 5 assets based on Options activity ranking |
-| **Intraday Focus** | Signals optimized for intraday trading (15-min execution) |
-| **Multi-Level S/R** | 2-3 support and resistance levels from Options walls |
-| **Whale Activity Tracking** | Monitors whale buy/sell volume and net flow |
+| **Intraday Focus** | Signals optimized for intraday trading (15-min execution) with multi-timeframe support |
+| **Multi-Level S/R** | 2-3 support and resistance levels from Options walls + Gamma levels |
+| **Whale Activity Tracking** | Monitors whale buy/sell volume with asset-specific thresholds |
 | **Options Analysis** | IV, PCR, Open Interest, Max Pain, Wall Detection |
-| **Smart SL/TP** | Risk levels calculated from wall-based support/resistance |
+| **Gamma Exposure (GEX)** | Dealer gamma positioning, flip levels, hedge pressure analysis |
+| **Sentiment Analysis** | Top Trader L/S Ratios + Funding Rate analysis for market sentiment |
+| **Smart SL/TP** | Risk levels calculated from wall-based and gamma-based support/resistance |
 | **Configuration** | YAML-based, fully parameterizable |
 | **Database** | SQLite with auto-rotation (weekly/monthly) |
+
+## New Features (v2.0)
+
+### 1. Asset-Specific Whale Thresholds
+Different whale detection thresholds for different assets:
+- **BTC**: $500,000 min premium, $2,000,000 block threshold
+- **ETH**: $200,000 min premium, $1,000,000 block threshold
+- **Others**: $100,000 min premium, $500,000 block threshold
+
+### 2. Gamma Exposure Calculator (GEX)
+Dealer positioning analysis including:
+- Total Gamma Exposure (GEX) calculation
+- Gamma flip level detection
+- Support/Resistance from gamma levels
+- Dealer hedge pressure indication (BUY_DIPS / SELL_RIPS)
+
+### 3. Multi-Timeframe Intraday Support
+Flexible intraday analysis with configurable timeframes:
+- **OI Periods**: 5m, 15m, 1h, 4h
+- **Volume Intervals**: 5m, 15m, 1h, 4h
+- Automatic or manual timeframe selection
+
+### 4. Sentiment Analysis Module
+Market sentiment from multiple sources:
+- **Top Trader Position Ratio**: Top 20% traders' long/short positioning
+- **Top Trader Account Ratio**: Top 20% accounts' positioning
+- **Funding Rate Analysis**: 7-day history with extreme detection
+- **Combined Sentiment Score**: Weighted combination with contrarian signals
 
 ## Quick Start
 
@@ -82,17 +115,12 @@ pip install -e ".[dev]"
 
 ### Dependencies
 
-This project uses the **official Binance Connector Python SDK** for API interactions:
+This project uses the **official Binance SDK** for API interactions:
 
 | Package | Purpose | Documentation |
 |---------|---------|---------------|
-| `binance-connector` | Official Binance API SDK | [GitHub](https://github.com/binance/binance-connector-python) |
-| `binance.um_futures` | USDT-M Futures (BTCUSDT, ETHUSDT, etc.) | [API Docs](https://binance-docs.github.io/apidocs/futures/en/) |
-| `binance.options` | Binance Options API | [API Docs](https://binance-docs.github.io/apidocs/options/en/) |
-
-The `binance-connector` package is automatically installed as a dependency. Key modules used:
-- `binance.um_futures` - For USDT-M Futures data (the futures contracts we're trading)
-- `binance.options` - For Options chain data (the analysis source)
+| `binance-sdk-derivatives-trading-usds-futures` | USDT-M Futures SDK | [PyPI](https://pypi.org/project/binance-sdk-derivatives-trading-usds-futures/) |
+| `binance-sdk-derivatives-trading-options` | Binance Options SDK | [PyPI](https://pypi.org/project/binance-sdk-derivatives-trading-options/) |
 
 ### Configuration
 
@@ -113,6 +141,9 @@ python -m binance_signal_generator
 # With custom config
 python -m binance_signal_generator --config /path/to/config.yaml
 
+# Verbose mode for debugging
+python -m binance_signal_generator --config config.yaml --dry-run -vv
+
 # Output: JSON to stdout + SQLite database
 ```
 
@@ -131,28 +162,30 @@ binance-options-futures-signal-generator/
 │       │   └── validators.py
 │       ├── data/
 │       │   ├── options_fetcher.py
-│       │   ├── futures_fetcher.py
+│       │   ├── futures_fetcher.py    # Includes sentiment & funding APIs
 │       │   └── cache.py
-│       ├── ranking/                    # NEW: Asset ranking system
+│       ├── ranking/
 │       │   ├── __init__.py
-│       │   ├── activity_scorer.py      # Score assets by Options activity
-│       │   └── asset_selector.py       # Select top N assets
+│       │   ├── activity_scorer.py    # Score assets by Options activity
+│       │   └── asset_selector.py     # Select top N assets
 │       ├── analysis/
 │       │   ├── iv_analyzer.py
 │       │   ├── pcr_analyzer.py
 │       │   ├── oi_analyzer.py
-│       │   ├── wall_detector.py        # NEW: Detect Options walls
+│       │   ├── wall_detector.py      # Detect Options walls
 │       │   ├── max_pain.py
+│       │   ├── gamma_exposure.py     # NEW: GEX calculator
+│       │   ├── sentiment.py          # NEW: L/S ratios + funding
 │       │   └── signal_scorer.py
-│       ├── whale/                      # NEW: Whale activity module
+│       ├── whale/
 │       │   ├── __init__.py
-│       │   ├── whale_detector.py       # Detect whale activity
-│       │   └── volume_analyzer.py      # Analyze whale volumes
+│       │   ├── whale_detector.py     # Asset-specific thresholds
+│       │   └── volume_analyzer.py
 │       ├── validation/
 │       │   └── futures_validator.py
 │       ├── output/
 │       │   ├── signal_generator.py
-│       │   ├── sr_levels.py            # NEW: Support/Resistance calculator
+│       │   ├── sr_levels.py          # S/R + Gamma levels
 │       │   └── database.py
 │       └── utils/
 ├── config/
@@ -175,33 +208,34 @@ EXECUTION FLOW (Single Run)
 ─────────────────────────────────────────────────────────────────────
 
 ┌─────────────────┐
-│ 1. OPTIONS      │  (~30 sec)                                     │
-│    ACTIVITY SCAN│  Scan all assets for activity scoring          │
-└────────┬────────┘                                                │
-         │                                                         │
-         ▼                                                         │
-┌─────────────────┐                                                │
-│ 2. ASSET        │  (~10 sec)                                     │
-│    RANKING      │  Rank assets, select Top 5                     │
-└────────┬────────┘                                                │
-         │                                                         │
-         ▼                                                         │
-┌─────────────────┐                                                │
-│ 3. DATA FETCH   │  (~2 min)                                      │
-│    Top 5 Assets │  Full Options+Futures data                     │
-└────────┬────────┘                                                │
-         │                                                         │
-         ▼                                                         │
-┌─────────────────┐                                                │
-│ 4. ANALYSIS     │  (~3 min)                                      │
-│    + WHALE      │  IV→PCR→OI→Walls→Whale→Score                   │
-└────────┬────────┘                                                │
-         │                                                         │
-         ▼                                                         │
-┌─────────────────┐                                                │
-│ 5. SIGNAL       │  (~1 min)                                      │
-│    OUTPUT       │  JSON Output + SQLite Save                     │
-└─────────────────┘                                                │
+│ 1. OPTIONS      │  (~30 sec)
+│    ACTIVITY SCAN│  Scan all assets for activity scoring
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ 2. ASSET        │  (~10 sec)
+│    RANKING      │  Rank assets, select Top 5
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ 3. DATA FETCH   │  (~2 min)
+│    Top 5 Assets │  Full Options+Futures+Sentiment data
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ 4. ANALYSIS     │  (~3 min)
+│    + GEX        │  IV→PCR→OI→Walls→GEX→Whale→Sentiment
+│    + Sentiment  │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ 5. SIGNAL       │  (~1 min)
+│    OUTPUT       │  JSON Output + SQLite Save
+└─────────────────┘
 
 TOTAL: ~7 minutes per execution
 ```
@@ -236,106 +270,135 @@ The system dynamically selects assets based on Options activity scoring:
 
 ```json
 {
-  "signal_id": "SIG_20240115_1430_BTCUSDT_LONG",
-  "timestamp": "2024-01-15T14:30:00Z",
+  "signal_id": "SIG_20260517_053622_BTCUSDT",
+  "timestamp": "2026-05-17T05:36:22.710409Z",
   "symbol": "BTCUSDT",
   "asset_rank": 1,
-  "activity_score": 0.87,
-  
+  "activity_score": 0.283,
   "direction": "LONG",
-  "entry_zone": {
-    "min": 42150.00,
-    "max": 42200.00,
-    "ideal": 42175.00
-  },
-  
-  "stop_loss": 41850.00,
-  "stop_loss_type": "WALL_BASED",
-  "stop_loss_wall": {
-    "type": "PUT_WALL",
-    "strike": 41800.00,
-    "oi_concentration": 0.23
-  },
-  
+  "confidence_score": 0.405,
+  "signal_strength": "WEAK",
+  "entry_zone": {"min": 77739.549, "max": 78520.851, "ideal": 78130.2},
+  "stop_loss": {"price": 75000.0, "type": "WALL_BASED", "distance_pct": 4.01},
   "take_profit_levels": [
-    {"level": 1, "price": 42500.00, "ratio": 0.5, "wall": "CALL_WALL_1"},
-    {"level": 2, "price": 42800.00, "ratio": 0.3, "wall": "CALL_WALL_2"},
-    {"level": 3, "price": 43200.00, "ratio": 0.2, "wall": "CALL_WALL_3"}
+    {"level": 1, "price": 79302.153, "ratio": 1.5, "distance_pct": 1.5},
+    {"level": 2, "price": 80474.106, "ratio": 3.0, "distance_pct": 3.0},
+    {"level": 3, "price": 82036.71, "ratio": 5.0, "distance_pct": 5.0}
   ],
-  
   "support_levels": [
-    {"level": 1, "price": 41850.00, "type": "PUT_WALL", "strength": 0.85},
-    {"level": 2, "price": 41500.00, "type": "PUT_WALL", "strength": 0.72},
-    {"level": 3, "price": 41200.00, "type": "MAX_PAIN", "strength": 0.65}
+    {"level": 1, "price": 75000.0, "oi": 111, "distance_pct": 4.05}
   ],
-  
   "resistance_levels": [
-    {"level": 1, "price": 42500.00, "type": "CALL_WALL", "strength": 0.88},
-    {"level": 2, "price": 42800.00, "type": "CALL_WALL", "strength": 0.75},
-    {"level": 3, "price": 43500.00, "type": "CALL_WALL", "strength": 0.62}
+    {"level": 1, "price": 94000.0, "gex": -5202517096.1, "strength": 0.67, "type": "GAMMA_RESISTANCE"}
   ],
-  
   "whale_metrics": {
-    "whale_buy_volume": 12500000.00,
-    "whale_sell_volume": 3200000.00,
-    "whale_net_volume": 9300000.00,
-    "whale_net_direction": "BULLISH",
-    "whale_activity_score": 0.78,
-    "large_trades_count": 47,
-    "avg_trade_size": 265957.45
+    "whale_buy_volume": 3785.55,
+    "whale_sell_volume": 4326.35,
+    "whale_net_volume": -540.80,
+    "whale_direction": "NEUTRAL",
+    "whale_activity_score": 0.504,
+    "large_trades_count": 60
   },
-  
   "options_metrics": {
-    "iv_rank": 0.65,
-    "pcr": 0.82,
-    "max_pain": 42000.00,
-    "max_pain_distance_pct": 0.4,
-    "put_wall": 41800.00,
-    "call_wall": 42500.00,
-    "oi_concentration": 0.71
+    "pcr_combined": 1.6462,
+    "iv_percentile": 0.35,
+    "max_pain_distance": -21.8302,
+    "wall_intensity": 0.0155,
+    "gex_regime": "POSITIVE",
+    "dealer_hedge_pressure": "BUY_DIPS",
+    "gamma_flip": 70352.79,
+    "total_gex": 77936192248.75,
+    "gamma_risk_score": 1.0,
+    "top_trader_position_ratio": 1.0,
+    "top_trader_account_ratio": 1.21,
+    "current_funding_rate": 0.0,
+    "funding_rate_avg_7d": 0.0,
+    "funding_rate_extreme": false,
+    "sentiment_score": 0.052,
+    "combined_sentiment": "NEUTRAL",
+    "is_contrarian_signal": false
   },
-  
   "futures_metrics": {
-    "liquidity_score": 0.92,
-    "trend_alignment": "BULLISH",
-    "volatility_state": "NORMAL",
-    "funding_rate": 0.0001
+    "price": 78130.2,
+    "volume_24h": 92944.894,
+    "open_interest": 102430.047,
+    "funding_rate": 0.0
   },
-  
-  "confidence_score": 0.78,
-  "signal_strength": "STRONG"
+  "risk_reward_ratio": 0.79
 }
 ```
 
-## Support/Resistance from Walls
-
-The system identifies 2-3 levels of support and resistance from Options walls:
+## Gamma Exposure (GEX) Analysis
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│            WALL-BASED SUPPORT/RESISTANCE DETECTION                 │
+│                  GAMMA EXPOSURE ANALYSIS                           │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  Current Price: $42,175                                            │
+│  GEX CALCULATION:                                                  │
+│  ─────────────────                                                 │
+│  GEX = Σ (Gamma × OI × 100 × Spot² × 0.01)                        │
 │                                                                     │
-│  RESISTANCE (above price):              SUPPORT (below price):    │
-│  ──────────────────────────              ───────────────────────── │
+│  INTERPRETATION:                                                   │
+│  ───────────────                                                   │
+│  Positive GEX (>0):                                               │
+│    • Dealers BUY dips, SELL rips                                  │
+│    • Price tends to stabilize                                     │
+│    • Lower volatility expected                                    │
 │                                                                     │
-│  R3: $43,500 ████████████ (Call Wall)   S3: $41,200 (Max Pain)   │
-│                    15% OI                          Strong Magnet   │
+│  Negative GEX (<0):                                               │
+│    • Dealers SELL dips, BUY rips                                  │
+│    • Price tends to accelerate                                    │
+│    • Higher volatility expected                                   │
 │                                                                     │
-│  R2: $42,800 ████████ (Call Wall)        S2: $41,500 ████ (Put)  │
-│                    12% OI                     18% OI               │
+│  GAMMA FLIP LEVEL:                                                │
+│  ──────────────────                                                │
+│  Price where GEX transitions from positive to negative            │
+│  Acts as key support/resistance level                             │
 │                                                                     │
-│  R1: $42,500 █████████████ (Call Wall)   S1: $41,850 ████ (Put)  │
-│                    23% OI                     22% OI  ← NEAREST    │
+│  SIGNAL INTEGRATION:                                               │
+│  ───────────────────                                               │
+│  • GEX regime influences confidence                               │
+│  • Gamma flip added to S/R levels                                 │
+│  • Dealer hedge pressure guides entry timing                      │
 │                                                                     │
-│  ───────────────────────────────────────────────────────────────   │
-│  ENTRY ZONE: $42,150 - $42,200                                     │
-│  STOP LOSS:  $41,850 (S1 - Put Wall below)                         │
-│  TP1: $42,500 (R1 - Call Wall above)                               │
-│  TP2: $42,800 (R2 - Second Call Wall)                              │
-│  TP3: $43,500 (R3 - Third Call Wall)                               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## Sentiment Analysis
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    SENTIMENT ANALYSIS MODULE                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  DATA SOURCES:                                                     │
+│  ──────────────                                                    │
+│  1. Top Trader Long/Short Position Ratio (Weight: 0 FREE)          │
+│     • Top 20% traders by margin balance                           │
+│     • Ratio > 1.0 = Long bias, < 1.0 = Short bias                 │
+│                                                                     │
+│  2. Top Trader Long/Short Account Ratio (Weight: 0 FREE)           │
+│     • Top 20% accounts positioning                                │
+│     • More sensitive to crowd sentiment                           │
+│                                                                     │
+│  3. Funding Rate History (Weight: 5 per request)                   │
+│     • 7-day funding rate history                                  │
+│     • Extreme funding = contrarian signals                        │
+│                                                                     │
+│  SIGNAL GENERATION:                                                │
+│  ─────────────────                                                 │
+│  • Combined sentiment score (0-1)                                 │
+│  • Contrarian signal detection                                    │
+│  • Funding rate extreme alerts                                    │
+│                                                                     │
+│  EXAMPLE OUTPUT:                                                   │
+│  ───────────────                                                   │
+│  ETHUSDT:                                                          │
+│    • Position Ratio: 1.36 (long bias)                             │
+│    • Account Ratio: 3.01 (strong long bias)                       │
+│    • Funding Rate: 0.0072% (normal)                               │
+│    • Combined Sentiment: BULLISH (0.37)                           │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -347,14 +410,19 @@ The system identifies 2-3 levels of support and resistance from Options walls:
 │                    WHALE ACTIVITY METRICS                          │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  WHALE DEFINITION: Trades > $100,000 notional value               │
+│  ASSET-SPECIFIC THRESHOLDS:                                       │
+│  ─────────────────────────                                         │
+│  Asset      Min Premium    Block Threshold                        │
+│  ────      ────────────    ───────────────                        │
+│  BTC       $500,000        $2,000,000                             │
+│  ETH       $200,000        $1,000,000                             │
+│  Others    $100,000        $500,000                               │
 │                                                                     │
 │  Detection Methods:                                                │
 │  ─────────────────                                                 │
 │  1. Options Block Trades     → Large premium transactions         │
 │  2. Unusual OI Changes       → Sudden position builds/unwinds     │
 │  3. Volume Spikes            → Abnormal trading activity          │
-│  4. Sweep Activity           → Aggressive option buying           │
 │                                                                     │
 │  Metrics Calculated:                                               │
 │  ──────────────────                                                │
@@ -364,12 +432,6 @@ The system identifies 2-3 levels of support and resistance from Options walls:
 │  • whale_net_direction : BULLISH / BEARISH / NEUTRAL              │
 │  • whale_activity_score: Normalized score (0-1)                   │
 │                                                                     │
-│  Signal Impact:                                                    │
-│  ─────────────                                                     │
-│  • Net positive + High activity → Boost LONG confidence           │
-│  • Net negative + High activity → Boost SHORT confidence          │
-│  • Low whale activity            → Rely on other analyzers        │
-│                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -378,156 +440,12 @@ The system identifies 2-3 levels of support and resistance from Options walls:
 | Document | Description |
 |----------|-------------|
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and design decisions |
-| [PIPELINE.md](docs/PIPELINE.md) | Data pipeline with asset ranking and whale detection |
-| [MODULES.md](docs/MODULES.md) | Module specifications including new modules |
-| [CONFIGURATION.md](docs/CONFIGURATION.md) | Configuration parameters for adaptive selection |
-| [DEVELOPMENT.md](docs/DEVELOPMENT.md) | Development roadmap with new features |
-
----
-
-## Output Format
-
-### Primary Output: JSON to Stdout
-
-The system outputs a **complete JSON signal bundle** to stdout for each execution:
-
-```json
-{
-  "execution_id": "EXEC_20240115_143000",
-  "timestamp": "2024-01-15T14:30:00Z",
-  "execution_duration_seconds": 420,
-  "assets_analyzed": 5,
-  "signals_generated": 3,
-  
-  "selected_assets": [
-    {
-      "rank": 1,
-      "symbol": "BTCUSDT",
-      "activity_score": 0.87,
-      "primary_driver": "WHALE_ACTIVITY"
-    },
-    {
-      "rank": 2,
-      "symbol": "ETHUSDT",
-      "activity_score": 0.82,
-      "primary_driver": "VOLUME_SPIKE"
-    },
-    {
-      "rank": 3,
-      "symbol": "SOLUSDT",
-      "activity_score": 0.75,
-      "primary_driver": "OI_CHANGE"
-    },
-    {
-      "rank": 4,
-      "symbol": "BNBUSDT",
-      "activity_score": 0.68,
-      "primary_driver": "IV_INTEREST"
-    },
-    {
-      "rank": 5,
-      "symbol": "ARBUSDT",
-      "activity_score": 0.61,
-      "primary_driver": "PCR_EXTREME"
-    }
-  ],
-  
-  "signals": [
-    {
-      "signal_id": "SIG_20240115_1430_BTCUSDT_LONG",
-      "timestamp": "2024-01-15T14:30:00Z",
-      "symbol": "BTCUSDT",
-      "asset_rank": 1,
-      "activity_score": 0.87,
-      
-      "direction": "LONG",
-      "confidence_score": 0.78,
-      "signal_strength": "STRONG",
-      
-      "entry_zone": {
-        "min": 42150.00,
-        "max": 42200.00,
-        "ideal": 42175.00
-      },
-      
-      "stop_loss": {
-        "price": 41850.00,
-        "type": "WALL_BASED",
-        "wall": {
-          "type": "PUT_WALL",
-          "strike": 41800.00,
-          "oi_concentration": 0.23
-        },
-        "distance_pct": 0.78
-      },
-      
-      "take_profit_levels": [
-        {"level": 1, "price": 42500.00, "ratio": 0.5, "distance_pct": 0.77, "wall_type": "CALL_WALL"},
-        {"level": 2, "price": 42800.00, "ratio": 0.3, "distance_pct": 1.48, "wall_type": "CALL_WALL"},
-        {"level": 3, "price": 43200.00, "ratio": 0.2, "distance_pct": 2.43, "wall_type": "CALL_WALL"}
-      ],
-      
-      "support_levels": [
-        {"level": 1, "price": 41850.00, "type": "PUT_WALL", "strength": 0.85},
-        {"level": 2, "price": 41500.00, "type": "PUT_WALL", "strength": 0.72},
-        {"level": 3, "price": 41200.00, "type": "MAX_PAIN", "strength": 0.65}
-      ],
-      
-      "resistance_levels": [
-        {"level": 1, "price": 42500.00, "type": "CALL_WALL", "strength": 0.88},
-        {"level": 2, "price": 42800.00, "type": "CALL_WALL", "strength": 0.75},
-        {"level": 3, "price": 43500.00, "type": "CALL_WALL", "strength": 0.62}
-      ],
-      
-      "whale_metrics": {
-        "whale_buy_volume": 12500000.00,
-        "whale_sell_volume": 3200000.00,
-        "whale_net_volume": 9300000.00,
-        "whale_net_direction": "BULLISH",
-        "whale_activity_score": 0.78,
-        "large_trades_count": 47,
-        "avg_trade_size": 265957.45
-      },
-      
-      "options_metrics": {
-        "iv_rank": 0.65,
-        "pcr": 0.82,
-        "max_pain": 42000.00,
-        "max_pain_distance_pct": 0.4,
-        "put_wall": 41800.00,
-        "call_wall": 42500.00,
-        "oi_concentration": 0.71
-      },
-      
-      "futures_metrics": {
-        "liquidity_score": 0.92,
-        "trend_alignment": "BULLISH",
-        "volatility_state": "NORMAL",
-        "funding_rate": 0.0001
-      },
-      
-      "risk_reward_ratio": 2.1
-    }
-  ],
-  
-  "metadata": {
-    "config_file": "/path/to/config.yaml",
-    "api_calls_made": 42,
-    "data_freshness_seconds": 15
-  }
-}
-```
-
-### Secondary Output: SQLite Database
-
-Signals are also persisted to SQLite for historical analysis:
-
-```
-./data/signals.db
-├── signals          # All generated signals
-├── executions       # Execution history
-└── asset_rankings   # Historical asset rankings
-```
+| [PIPELINE.md](docs/PIPELINE.md) | Data pipeline with all analysis modules |
+| [MODULES.md](docs/MODULES.md) | Module specifications including GEX and sentiment |
+| [CONFIGURATION.md](docs/CONFIGURATION.md) | Configuration parameters including intraday settings |
+| [DEVELOPMENT.md](docs/DEVELOPMENT.md) | Development roadmap with completed features |
+| [SIGNAL_GENERATION_FLOW.md](docs/SIGNAL_GENERATION_FLOW.md) | Complete A-Z signal generation process |
+| [CLI_COMMANDS.md](docs/CLI_COMMANDS.md) | CLI reference and examples |
 
 ---
 
@@ -553,7 +471,8 @@ Signals are also persisted to SQLite for historical analysis:
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `binance-connector` | >=3.0.0 | Official Binance API SDK |
+| `binance-sdk-derivatives-trading-usds-futures` | Latest | Official Binance Futures SDK |
+| `binance-sdk-derivatives-trading-options` | Latest | Official Binance Options SDK |
 | `pyyaml` | >=6.0 | Configuration file parsing |
 | `aiohttp` | >=3.8.0 | Async HTTP client |
 | `pydantic` | >=2.0 | Data validation |
@@ -567,6 +486,26 @@ All dependencies are automatically installed via `pip install -e .`
 | Scheduling | Run every 15 minutes | External cronjob / task scheduler |
 | Notifications | Send alerts | External Telegram bot / notification system |
 | Signal Generation | Analyze & output signals | **This system** |
+
+## API Rate Limits
+
+The system is designed to stay well within Binance rate limits:
+
+| API | Weight | Calls/Cycle | Total Weight |
+|-----|--------|-------------|--------------|
+| Exchange Info | 1 | 1 | 1 |
+| OI History | 0 (FREE) | 6 | 0 |
+| Klines | 2 | 6 | 12 |
+| Options Tickers | 1 | 2 | 2 |
+| Options OI | 1 | 2 | 2 |
+| Block Trades | 1 | 2 | 2 |
+| Futures Ticker | 1 | 2 | 2 |
+| **Top Trader L/S Position** | 0 (FREE) | 2 | 0 |
+| **Top Trader L/S Account** | 0 (FREE) | 2 | 0 |
+| **Funding Rate History** | 5 | 2 | 10 |
+| **Total per cycle** | | ~41 | **~43** |
+
+**Binance Limit: 2400 weight/minute** → System uses ~2% of limit
 
 ## Disclaimer
 

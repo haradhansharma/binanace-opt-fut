@@ -167,17 +167,25 @@ class ActivityScorer:
         metrics.primary_driver = self.identify_primary_driver(metrics).value
         return metrics
     
-    def score_from_chain(self, chain: OptionsChain, whale_activity: float = 0.0) -> ActivityMetrics:
+    def score_from_chain(
+        self,
+        chain: OptionsChain,
+        whale_activity: float = 0.0,
+        oi_change_pct: float = 0.0,
+        volume_spike_score: float = 0.0,
+    ) -> ActivityMetrics:
         """
         Score an asset from its options chain.
-        
+
         This is a convenience method that extracts metrics from
         the options chain and calculates the score.
-        
+
         Args:
             chain: Options chain data
             whale_activity: Whale activity score (0-1), calculated externally
-            
+            oi_change_pct: OI change percentage (e.g., 5.0 for +5%), from /futures/data/openInterestHist
+            volume_spike_score: Volume spike ratio (e.g., 2.5 for 2.5x avg), from /fapi/v1/klines
+
         Returns:
             ActivityMetrics with score
         """
@@ -188,27 +196,27 @@ class ActivityScorer:
             s for s in chain.strikes.values()
             if s.call.open_interest > 0 or s.put.open_interest > 0
         ])
-        
+
         # Calculate PCR extremeness
         pcr = chain.get_pcr()
         pcr_extremeness = self._calc_pcr_extremeness(pcr)
-        
+
         # Get IV percentile from real mark price data
         iv_percentile = self._estimate_iv_percentile(chain)
-        
-        # Create metrics
+
+        # Create metrics with historical data (now passed as parameters)
         metrics = ActivityMetrics(
             symbol=chain.underlying,
             timestamp=datetime.utcnow(),
-            oi_change_pct=0.0,  # Requires historical data
-            volume_spike_score=0.0,  # Requires historical data
+            oi_change_pct=oi_change_pct,  # From /futures/data/openInterestHist
+            volume_spike_score=volume_spike_score,  # From /fapi/v1/klines
             iv_percentile=iv_percentile,
             pcr_extremeness=pcr_extremeness,
             whale_activity=whale_activity,
             total_options_volume=total_volume,
             num_strikes_active=active_strikes,
         )
-        
+
         # Score the metrics
         return self.score_metrics(metrics)
     

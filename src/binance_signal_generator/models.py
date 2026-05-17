@@ -276,6 +276,124 @@ class WallAnalysis:
 
 
 # =============================================================================
+# Sentiment Analysis Models (L/S Ratios, Funding Rate)
+# =============================================================================
+
+@dataclass
+class LSRatioData:
+    """Long/Short ratio data point."""
+    timestamp: datetime
+    long_short_ratio: float  # > 1 = longs dominate, < 1 = shorts dominate
+    long_account: float  # Proportion of longs (0-1)
+    short_account: float  # Proportion of shorts (0-1)
+
+
+@dataclass
+class FundingRateData:
+    """Funding rate data point."""
+    timestamp: datetime
+    funding_rate: float  # Positive = longs pay shorts, Negative = shorts pay longs
+    mark_price: float
+
+
+@dataclass
+class ExerciseRecord:
+    """Historical option exercise record."""
+    symbol: str
+    strike_price: float
+    real_strike_price: float
+    expiry_date: datetime
+    strike_result: str  # "REALISTIC_VALUE_STRICKEN" (exercised ITM) or "EXTRINSIC_VALUE_EXPIRED" (expired OTM)
+
+
+@dataclass
+class SentimentAnalysis:
+    """
+    Complete sentiment analysis from multiple sources.
+    
+    Combines:
+    - Top Trader L/S Ratio (Positions): Top 20% traders by margin
+    - Top Trader L/S Ratio (Accounts): Account-level positioning
+    - Global L/S Ratio: Market-wide sentiment
+    - Funding Rate: Cost of holding positions
+    """
+    symbol: str
+    timestamp: datetime
+    
+    # Top Trader Position Ratio (by position size)
+    top_trader_position_ratio: float = 1.0  # Latest value
+    top_trader_position_trend: str = "NEUTRAL"  # "BULLISH", "BEARISH", "NEUTRAL"
+    top_trader_position_score: float = 0.0  # -1 to 1
+    
+    # Top Trader Account Ratio (by account count)
+    top_trader_account_ratio: float = 1.0
+    top_trader_account_trend: str = "NEUTRAL"
+    top_trader_account_score: float = 0.0
+    
+    # Funding Rate Analysis
+    current_funding_rate: float = 0.0
+    funding_rate_avg_7d: float = 0.0
+    funding_rate_extreme: bool = False
+    funding_rate_score: float = 0.0  # -1 to 1
+    
+    # Combined Sentiment
+    combined_sentiment: str = "NEUTRAL"  # "BULLISH", "BEARISH", "NEUTRAL"
+    sentiment_score: float = 0.0  # -1 to 1 (negative = bearish, positive = bullish)
+    confidence: float = 0.0
+    
+    # Signal
+    signal: SignalDirection = SignalDirection.NEUTRAL
+    signal_confidence: float = 0.0
+    
+    # Contrarian Indicator
+    is_contrarian_signal: bool = False  # True if extreme sentiment suggests reversal
+
+
+# =============================================================================
+# Gamma Exposure Models (Dealer Hedging Levels)
+# =============================================================================
+
+@dataclass
+class GammaLevel:
+    """Represents a significant gamma level for dealer hedging."""
+    strike: float
+    gex_value: float  # In $ terms
+    gex_normalized: float  # As % of total
+    level_type: str  # "SUPPORT", "RESISTANCE", "NEUTRAL"
+    dealer_behavior: str  # Description of expected dealer behavior
+    strength: float  # 0-1 strength score
+
+
+@dataclass
+class GammaAnalysis:
+    """Results of gamma exposure analysis for dealer hedging levels."""
+    symbol: str
+    spot_price: float
+    timestamp: datetime
+    
+    # Aggregate metrics
+    total_gex: float = 0.0  # Total gamma exposure in $
+    total_call_gex: float = 0.0
+    total_put_gex: float = 0.0
+    gex_per_spot: float = 0.0  # GEX normalized by spot price
+    
+    # Key levels
+    gamma_flip: Optional[float] = None  # Price where GEX flips sign
+    absolute_gamma_surface: float = 0.0  # Total absolute GEX (volatility indicator)
+    
+    # Support and resistance levels from GEX
+    gex_support_levels: List[GammaLevel] = field(default_factory=list)
+    gex_resistance_levels: List[GammaLevel] = field(default_factory=list)
+    
+    # Interpretation
+    gex_regime: str = "NEUTRAL"  # "POSITIVE" (dealers support), "NEGATIVE" (dealers resist), "NEUTRAL"
+    dealer_hedge_pressure: str = "MIXED"  # "BUY_DIPS", "SELL_RALLIES", "MIXED"
+    
+    # Risk metrics
+    gamma_risk_score: float = 0.0  # 0-1, higher = more volatile expected
+
+
+# =============================================================================
 # S/R Level Models
 # =============================================================================
 

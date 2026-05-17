@@ -12,13 +12,11 @@
 3. [Basic Usage](#basic-usage)
 4. [Command-Line Options](#command-line-options)
 5. [Output Formats](#output-formats)
-6. [Configuration](#configuration)
-7. [Environment Variables](#environment-variables)
+6. [Signal Output Schema](#signal-output-schema)
+7. [Configuration](#configuration)
 8. [Testing Commands](#testing-commands)
 9. [Common Workflows](#common-workflows)
-10. [Error Handling](#error-handling)
-11. [Exit Codes](#exit-codes)
-12. [Examples](#examples)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -32,12 +30,14 @@ The Binance Signal Generator CLI (`binance-signals`) is the primary interface fo
 - **Manual Symbol Override**: Analyze specific symbols on demand
 - **Flexible Output**: JSON to stdout or file, with pretty-printing options
 - **Dry-Run Mode**: Test without database persistence
-- **Configuration Validation**: Validate config before running
 - **Verbose Logging**: Multiple verbosity levels for debugging
+- **NEW: Sentiment Analysis**: Top Trader L/S ratios + Funding rate
+- **NEW: Gamma Exposure**: GEX calculation with dealer pressure
 
 ---
 
 ## Installation
+
 ```bash
 # Remove old packages
 pip uninstall binance-connector binance-sdk-derivatives-trading-usds-futures -y 2>/dev/null
@@ -49,25 +49,6 @@ pip install -e . --force-reinstall
 python -m binance_signal_generator --version
 ```
 
-### From Source
-
-```bash
-# Clone the repository
-git clone <repository-url>
-cd binance-options-futures-signal-generator
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # Linux/macOS
-# or: venv\Scripts\activate  # Windows
-
-# Install in development mode
-pip install -e .
-
-# Or install with development dependencies
-pip install -e ".[dev]"
-```
-
 ### Verify Installation
 
 ```bash
@@ -75,7 +56,7 @@ pip install -e ".[dev]"
 python -m binance_signal_generator --version
 
 # Expected output:
-# binance-signals 1.0.0
+# binance-signals 2.0.0
 ```
 
 ---
@@ -114,17 +95,17 @@ python -m binance_signal_generator -vv
 | Option | Short | Type | Default | Description |
 |--------|-------|------|---------|-------------|
 | `--config` | `-c` | PATH | `./config.yaml` | Path to configuration file |
-| `--symbols` | | SYMBOL [...] | None | Specific symbols to analyze (bypasses adaptive selection) |
+| `--symbols` | | SYMBOL [...] | None | Specific symbols to analyze |
 | `--dry-run` | | flag | False | Run without saving to database |
 | `--top-n` | | N | 5 | Number of top assets to analyze |
-| `--min-confidence` | | SCORE | 0.50 | Minimum signal confidence to output |
+| `--min-confidence` | | SCORE | 0.30 | Minimum signal confidence to output |
 
 ### Output Options
 
 | Option | Short | Type | Default | Description |
 |--------|-------|------|---------|-------------|
 | `--output` | `-o` | PATH | stdout | Write output to file |
-| `--pretty` | | flag | False | Pretty print JSON with indentation |
+| `--pretty` | | flag | False | Pretty print JSON |
 | `--compact` | | flag | False | Output one signal per line |
 
 ### Logging Options
@@ -134,83 +115,201 @@ python -m binance_signal_generator -vv
 | `--verbose` | `-v` | count | 0 | Increase verbosity (-v, -vv) |
 | `--quiet` | `-q` | flag | False | Suppress all output except signals |
 
-### Utility Options
-
-| Option | Description |
-|--------|-------------|
-| `--version` | Show version and exit |
-| `--validate-config` | Validate configuration and exit |
-| `--help` | Show help message and exit |
-
 ---
 
 ## Output Formats
 
 ### Standard JSON Output
 
-Default output is a single JSON object with execution metadata and signals:
-
 ```json
 {
-  "execution_id": "EXEC_20250516_123456_abc123",
-  "timestamp": "2025-05-16T12:34:56Z",
-  "execution_duration_seconds": 45.2,
-  "assets_analyzed": 5,
-  "signals_generated": 3,
+  "execution_id": "EXEC_20260517_053558_10642a23",
+  "timestamp": "2026-05-17T05:35:58.734777Z",
+  "execution_duration_seconds": 29.39,
+  "assets_analyzed": 2,
+  "signals_generated": 2,
+  "signals": [...],
   "selected_assets": [
     {
       "symbol": "BTCUSDT",
       "rank": 1,
-      "activity_score": 0.85,
-      "primary_driver": "WHALE_ACTIVITY"
+      "activity_score": 0.283,
+      "primary_driver": "TOTAL_VOLUME"
     }
   ],
-  "signals": [...],
   "metadata": {
-    "config_file": "config.yaml",
-    "api_calls_made": 42,
-    "data_freshness_seconds": 1.5,
+    "config_file": "config/config.yaml",
+    "api_calls_made": 41,
+    "data_freshness_seconds": 0.0,
     "errors": []
   }
 }
 ```
 
-### Pretty Print Mode
+---
 
-```bash
-python -m binance_signal_generator --pretty
-```
+## Signal Output Schema
 
-Outputs formatted JSON with 2-space indentation for readability.
+Each generated signal contains the following fields:
 
-### Compact Mode
+### Core Signal Fields
 
-```bash
-python -m binance_signal_generator --compact
-```
+| Field | Type | Description |
+|-------|------|-------------|
+| `signal_id` | string | Unique identifier (SIG_YYYYMMDD_HHMMSS_SYMBOL) |
+| `timestamp` | string | ISO 8601 timestamp |
+| `symbol` | string | Trading pair (e.g., BTCUSDT) |
+| `direction` | enum | LONG, SHORT, or NEUTRAL |
+| `confidence_score` | float | Signal confidence (0.0-1.0) |
+| `signal_strength` | enum | WEAK, MODERATE, STRONG, VERY_STRONG |
 
-Outputs one signal per line, suitable for log processing or streaming:
+### Entry & Risk Management
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `entry_zone` | object | Entry price range (min, max, ideal) |
+| `stop_loss` | object | Stop loss price and type |
+| `take_profit_levels` | array | Up to 3 TP levels with ratios |
+| `support_levels` | array | Support levels from put walls + gamma |
+| `resistance_levels` | array | Resistance levels from call walls + gamma |
+| `risk_reward_ratio` | float | Calculated R:R ratio |
+
+### Whale Metrics (Asset-Specific Thresholds)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `whale_buy_volume` | float | Total bullish whale $ volume |
+| `whale_sell_volume` | float | Total bearish whale $ volume |
+| `whale_net_volume` | float | Net whale volume (buy - sell) |
+| `whale_direction` | string | BULLISH, BEARISH, NEUTRAL |
+| `whale_activity_score` | float | Normalized activity (0-1) |
+| `large_trades_count` | int | Number of whale trades |
+
+### Options Metrics (with GEX + Sentiment)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pcr_combined` | float | Combined Put/Call ratio |
+| `iv_percentile` | float | IV percentile (0-1) |
+| `max_pain_distance` | float | Distance to max pain (%) |
+| `wall_intensity` | float | Wall strength indicator |
+| `wall_imbalance` | float | Put/Call wall imbalance |
+| **`gex_regime`** | string | POSITIVE, NEGATIVE, NEUTRAL |
+| **`dealer_hedge_pressure`** | string | BUY_DIPS, SELL_RIPS |
+| **`gamma_flip`** | float | Price where GEX flips sign |
+| **`total_gex`** | float | Total gamma exposure ($) |
+| **`gamma_risk_score`** | float | Normalized risk (0-1) |
+| **`top_trader_position_ratio`** | float | Top 20% traders L/S position ratio |
+| **`top_trader_account_ratio`** | float | Top 20% accounts L/S ratio |
+| **`current_funding_rate`** | float | Current funding rate |
+| **`funding_rate_avg_7d`** | float | 7-day average funding rate |
+| **`funding_rate_extreme`** | bool | Is funding rate extreme? |
+| **`sentiment_score`** | float | Combined sentiment (0-1) |
+| **`combined_sentiment`** | string | NEUTRAL, BULLISH, BEARISH |
+| **`is_contrarian_signal`** | bool | Contrarian signal detected? |
+
+### Futures Metrics
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `price` | float | Current futures price |
+| `volume_24h` | float | 24-hour volume |
+| `open_interest` | float | Open interest |
+| `funding_rate` | float | Current funding rate |
+
+---
+
+## Complete Signal Example
 
 ```json
-{"signal_id": "SIG_001", "symbol": "BTCUSDT", ...}
-{"signal_id": "SIG_002", "symbol": "ETHUSDT", ...}
+{
+  "signal_id": "SIG_20260517_053622_BTCUSDT",
+  "timestamp": "2026-05-17T05:36:22.710409Z",
+  "symbol": "BTCUSDT",
+  "asset_rank": 1,
+  "activity_score": 0.283,
+  "direction": "LONG",
+  "confidence_score": 0.405,
+  "signal_strength": "WEAK",
+  "entry_zone": {
+    "min": 77739.549,
+    "max": 78520.851,
+    "ideal": 78130.2
+  },
+  "stop_loss": {
+    "price": 75000.0,
+    "type": "WALL_BASED",
+    "distance_pct": 4.01
+  },
+  "take_profit_levels": [
+    {"level": 1, "price": 79302.153, "ratio": 1.5, "distance_pct": 1.5},
+    {"level": 2, "price": 80474.106, "ratio": 3.0, "distance_pct": 3.0},
+    {"level": 3, "price": 82036.71, "ratio": 5.0, "distance_pct": 5.0}
+  ],
+  "support_levels": [
+    {"level": 1, "price": 75000.0, "oi": 111, "distance_pct": 4.05}
+  ],
+  "resistance_levels": [
+    {"level": 1, "price": 94000.0, "gex": -5202517096.1, "strength": 0.67, "type": "GAMMA_RESISTANCE"}
+  ],
+  "whale_metrics": {
+    "whale_buy_volume": 3785.55,
+    "whale_sell_volume": 4326.35,
+    "whale_net_volume": -540.80,
+    "whale_direction": "NEUTRAL",
+    "whale_activity_score": 0.504,
+    "large_trades_count": 60
+  },
+  "options_metrics": {
+    "pcr_combined": 1.6462,
+    "iv_percentile": 0.35,
+    "max_pain_distance": -21.8302,
+    "wall_intensity": 0.0155,
+    "wall_imbalance": 1.0,
+    "gex_regime": "POSITIVE",
+    "dealer_hedge_pressure": "BUY_DIPS",
+    "gamma_flip": 70352.79,
+    "total_gex": 77936192248.75,
+    "gamma_risk_score": 1.0,
+    "top_trader_position_ratio": 1.0,
+    "top_trader_account_ratio": 1.21,
+    "current_funding_rate": 0.0,
+    "funding_rate_avg_7d": 0.0,
+    "funding_rate_extreme": false,
+    "sentiment_score": 0.052,
+    "combined_sentiment": "NEUTRAL",
+    "is_contrarian_signal": false
+  },
+  "futures_metrics": {
+    "price": 78130.2,
+    "volume_24h": 92944.894,
+    "open_interest": 102430.047,
+    "funding_rate": 0.0
+  },
+  "risk_reward_ratio": 0.79
+}
 ```
 
-### File Output
+---
 
-```bash
-python -m binance_signal_generator --output signals.json --pretty
-```
+## Pipeline Stages
 
-Writes output to specified file instead of stdout.
+The CLI executes a 6-stage pipeline:
+
+| Stage | Name | Description |
+|-------|------|-------------|
+| 1 | Activity Scan | Scan all assets for activity scores |
+| 2 | Asset Selection | Select top N assets by activity |
+| 3 | Data Fetching | Fetch Options + Futures + Sentiment data |
+| 4 | Analysis | Run IV, PCR, OI, Max Pain, GEX, Sentiment |
+| 5 | Whale/Wall Detection | Detect whale activity and OI walls |
+| 6 | Signal Generation | Create and output trading signals |
 
 ---
 
 ## Configuration
 
 ### Configuration File
-
-The CLI requires a YAML configuration file. Use `config.example.yaml` as a template:
 
 ```bash
 # Copy example config
@@ -226,62 +325,13 @@ nano config.yaml
 |---------|-------------|
 | `binance` | API credentials and connection settings |
 | `ranking` | Asset selection and activity scoring |
-| `pipeline` | Pipeline timeout and execution settings |
-| `whale` | Whale detection thresholds |
-| `walls` | Wall detection parameters |
-| `analysis` | IV, PCR, OI, Max Pain analysis settings |
-| `validation` | Futures validation rules |
+| `intraday` | Multi-timeframe settings (NEW) |
+| `whale` | Whale detection thresholds per asset (NEW) |
+| `sentiment` | L/S ratio and funding analysis (NEW) |
+| `gamma_exposure` | GEX calculation settings (NEW) |
+| `analysis` | IV, PCR, OI, Max Pain settings |
 | `output` | Signal output and filtering |
 | `logging` | Logging configuration |
-
-### Validate Configuration
-
-```bash
-# Validate configuration without running pipeline
-python -m binance_signal_generator --config config.yaml --validate-config
-
-# Success output:
-# Configuration is valid
-
-# Failure output (to stderr):
-# Configuration validation failed: <error message>
-```
-
----
-
-## Environment Variables
-
-### Required Variables
-
-```bash
-# Binance API credentials
-export BINANCE_API_KEY="your-api-key"
-export BINANCE_API_SECRET="your-api-secret"
-```
-
-### Optional Variables
-
-```bash
-# Use testnet
-export BINANCE_USE_TESTNET="true"
-
-# Custom config path
-export BINANCE_SIGNALS_CONFIG="/path/to/config.yaml"
-
-# Log level override
-export LOG_LEVEL="DEBUG"
-```
-
-### Using Environment Variables in Config
-
-The configuration file supports environment variable substitution:
-
-```yaml
-binance:
-  api_key: ${BINANCE_API_KEY}
-  api_secret: ${BINANCE_API_SECRET}
-  testnet: ${BINANCE_USE_TESTNET:-false}
-```
 
 ---
 
@@ -300,7 +350,7 @@ pytest tests/ -v
 pytest tests/ --cov=binance_signal_generator --cov-report=html
 ```
 
-### Run Specific Test Files
+### Run Specific Tests
 
 ```bash
 # Configuration tests
@@ -309,68 +359,14 @@ pytest tests/unit/test_config.py -v
 # Data fetcher tests
 pytest tests/unit/test_data.py -v
 
-# Analysis tests
-pytest tests/unit/test_analysis.py -v
+# Sentiment tests (NEW)
+pytest tests/unit/test_sentiment.py -v
 
-# Whale detection tests
-pytest tests/unit/test_whale.py -v
-
-# Wall detection tests
-pytest tests/unit/test_wall.py -v
+# GEX tests (NEW)
+pytest tests/unit/test_gamma.py -v
 
 # Pipeline tests
 pytest tests/unit/test_pipeline.py -v
-```
-
-### Run Specific Test Classes
-
-```bash
-# Run specific test class
-pytest tests/unit/test_analysis.py::TestIVAnalyzer -v
-
-# Run specific test method
-pytest tests/unit/test_whale.py::TestWhaleDetector::test_detect_whale_trade -v
-```
-
-### Run with Markers
-
-```bash
-# Run only async tests
-pytest tests/ -m asyncio
-
-# Run only integration tests (if marked)
-pytest tests/ -m integration
-
-# Skip slow tests
-pytest tests/ -m "not slow"
-```
-
-### Coverage Report
-
-```bash
-# Generate coverage report
-pytest tests/ --cov=binance_signal_generator --cov-report=term-missing
-
-# Generate HTML coverage report
-pytest tests/ --cov=binance_signal_generator --cov-report=html
-open htmlcov/index.html  # View report
-```
-
-### Test Configuration
-
-Tests use `pytest.ini` or `pyproject.toml` configuration:
-
-```toml
-# pyproject.toml
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-asyncio_mode = "auto"
-addopts = "-v --tb=short"
-markers = [
-    "asyncio: async tests",
-    "integration: integration tests",
-    "slow: slow running tests",
-]
 ```
 
 ---
@@ -380,83 +376,58 @@ markers = [
 ### 1. Daily Signal Generation
 
 ```bash
-# Generate signals with default settings
 python -m binance_signal_generator --config config.yaml --output signals_$(date +%Y%m%d).json
 ```
 
-### 2. Monitor Specific Assets
+### 2. Development/Testing Mode
 
 ```bash
-# Monitor BTC and ETH only
-python -m binance_signal_generator --symbols BTCUSDT ETHUSDT --pretty
-```
-
-### 3. Development/Testing Mode
-
-```bash
-# Dry run with verbose output
 python -m binance_signal_generator --config config.yaml --dry-run -vv --pretty
 ```
 
-### 4. Integration with External Systems
+### 3. Monitor Specific Assets
 
 ```bash
-# Pipe output to external notification system
-python -m binance_signal_generator | python notify.py
-
-# Write to file for processing
-python -m binance_signal_generator --output signals.json
-python process_signals.py signals.json
+python -m binance_signal_generator --symbols BTCUSDT ETHUSDT --pretty
 ```
 
-### 5. Scheduled Execution (Cron)
+### 4. Scheduled Execution (Cron)
 
 ```cron
-# Run every 4 hours
-0 */4 * * * cd /path/to/project && ./venv/bin/python -m binance_signal_generator --config config.yaml --output /var/log/signals/$(date +\%Y\%m\%d_\%H\%M\%S).json 2>> /var/log/signal_generator.log
-```
-
-### 6. Quick Signal Check
-
-```bash
-# Quick check with minimal output
-python -m binance_signal_generator -q --top-n 3
+# Run every 15 minutes
+*/15 * * * * cd /path/to/project && ./venv/bin/python -m binance_signal_generator --config config.yaml --output /var/log/signals/$(date +\%Y\%m\%d_\%H\%M\%S).json 2>> /var/log/signal_generator.log
 ```
 
 ---
 
-## Error Handling
+## Troubleshooting
 
-### Common Errors
-
-| Error | Cause | Solution |
-|-------|-------|----------|
-| `Config file not found` | Missing config.yaml | Create config from example |
-| `Invalid API credentials` | Wrong API key/secret | Check environment variables |
-| `Rate limit exceeded` | Too many API requests | Reduce request frequency |
-| `No assets selected` | No assets met criteria | Lower `min_activity_score` |
-| `Pipeline timeout` | Execution too slow | Increase timeout in config |
-
-### Error Output
-
-Errors are written to stderr, while signals go to stdout:
+### Issue: No Signals Generated
 
 ```bash
-# Capture signals to file, errors to log
-python -m binance_signal_generator > signals.json 2> errors.log
+# Lower activity threshold in config.yaml
+# ranking.min_activity_score: 0.10
+
+# Lower confidence threshold
+python -m binance_signal_generator --min-confidence 0.25
+
+# Check with verbose output
+python -m binance_signal_generator -vv
 ```
 
-### Debugging
+### Issue: API Rate Limits
 
 ```bash
-# Enable debug logging
-python -m binance_signal_generator -vv --dry-run
+# Reduce rate in config.yaml
+# binance.rate_limit.requests_per_second: 5
+```
 
-# Shows:
-# - API calls made
-# - Asset selection process
-# - Analysis details
-# - Signal generation steps
+### Issue: Connection Timeout
+
+```bash
+# Increase timeout in config.yaml
+# binance.timeout.connect_seconds: 30
+# binance.timeout.read_seconds: 60
 ```
 
 ---
@@ -466,220 +437,8 @@ python -m binance_signal_generator -vv --dry-run
 | Code | Meaning | Description |
 |------|---------|-------------|
 | 0 | Success | Pipeline completed with signals generated |
-| 1 | Error | Configuration error, API error, or no signals generated |
+| 1 | Error | Configuration error, API error, or no signals |
 | 130 | Interrupted | User interrupted with Ctrl+C |
-
-### Using Exit Codes in Scripts
-
-```bash
-#!/bin/bash
-python -m binance_signal_generator --config config.yaml
-exit_code=$?
-
-if [ $exit_code -eq 0 ]; then
-    echo "Signals generated successfully"
-elif [ $exit_code -eq 130 ]; then
-    echo "Interrupted by user"
-else
-    echo "Error occurred (exit code: $exit_code)"
-fi
-```
-
----
-
-## Examples
-
-### Example 1: Basic Signal Generation
-
-```bash
-# Generate signals for top 5 assets
-python -m binance_signal_generator --config config.yaml
-
-# Output:
-# {"execution_id": "EXEC_20250516_120000_abc123", ...}
-```
-
-### Example 2: Analyze Specific Symbols
-
-```bash
-# Analyze BTC, ETH, and SOL
-python -m binance_signal_generator --symbols BTCUSDT ETHUSDT SOLUSDT --pretty
-
-# Output:
-# {
-#   "execution_id": "EXEC_20250516_120000_def456",
-#   "signals": [
-#     {
-#       "signal_id": "SIG_20250516_120000_BTCUSDT",
-#       "symbol": "BTCUSDT",
-#       "direction": "LONG",
-#       "confidence_score": 0.78,
-#       ...
-#     }
-#   ]
-# }
-```
-
-### Example 3: Development Mode
-
-```bash
-# Full debug output, no database writes
-python -m binance_signal_generator --config config.yaml --dry-run -vv --pretty
-
-# Shows detailed execution:
-# [DEBUG] Initializing pipeline orchestrator
-# [DEBUG] Fetching available underlyings
-# [DEBUG] Found 25 underlyings
-# [DEBUG] Scanning activity for BTCUSDT...
-# ...
-```
-
-### Example 4: Filter by Confidence
-
-```bash
-# Only output signals with >= 70% confidence
-python -m binance_signal_generator --min-confidence 0.70 --pretty
-```
-
-### Example 5: Adjust Asset Count
-
-```bash
-# Analyze top 10 assets instead of default 5
-python -m binance_signal_generator --top-n 10
-```
-
-### Example 6: Integration Script
-
-```bash
-#!/bin/bash
-# run_signals.sh - Daily signal generation script
-
-CONFIG_FILE="/app/config.yaml"
-OUTPUT_DIR="/app/output"
-DATE=$(date +%Y%m%d_%H%M%S)
-OUTPUT_FILE="${OUTPUT_DIR}/signals_${DATE}.json"
-LOG_FILE="/app/logs/signals.log"
-
-# Create directories
-mkdir -p "${OUTPUT_DIR}" /app/logs
-
-# Run signal generator
-echo "$(date): Starting signal generation" >> "${LOG_FILE}"
-python -m binance_signal_generator \
-    --config "${CONFIG_FILE}" \
-    --output "${OUTPUT_FILE}" \
-    --top-n 5 \
-    --min-confidence 0.60 \
-    2>> "${LOG_FILE}"
-
-exit_code=$?
-
-if [ ${exit_code} -eq 0 ]; then
-    echo "$(date): Successfully generated signals to ${OUTPUT_FILE}" >> "${LOG_FILE}"
-    # Process signals with external system
-    python /app/process_signals.py "${OUTPUT_FILE}"
-else
-    echo "$(date): Signal generation failed with exit code ${exit_code}" >> "${LOG_FILE}"
-fi
-
-exit ${exit_code}
-```
-
-### Example 7: Real-time Monitoring
-
-```bash
-# Watch mode - run every 15 minutes
-watch -n 900 'python -m binance_signal_generator -q --top-n 3'
-```
-
----
-
-## Signal Output Schema
-
-Each generated signal contains the following fields:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `signal_id` | string | Unique identifier (SIG_YYYYMMDD_HHMMSS_SYMBOL) |
-| `timestamp` | string | ISO 8601 timestamp |
-| `symbol` | string | Trading pair (e.g., BTCUSDT) |
-| `direction` | enum | LONG, SHORT, or NEUTRAL |
-| `confidence_score` | float | Signal confidence (0.0-1.0) |
-| `signal_strength` | enum | WEAK, MODERATE, STRONG, VERY_STRONG |
-| `entry_zone` | object | Entry price range (min, max, ideal) |
-| `stop_loss` | object | Stop loss price and type |
-| `take_profit_levels` | array | Up to 3 TP levels with ratios |
-| `support_levels` | array | Support levels from put walls |
-| `resistance_levels` | array | Resistance levels from call walls |
-| `whale_metrics` | object | Whale activity analysis |
-| `options_metrics` | object | Options market metrics |
-| `futures_metrics` | object | Futures market data |
-| `risk_reward_ratio` | float | Calculated R:R ratio |
-
----
-
-## Pipeline Stages
-
-The CLI executes a 6-stage pipeline:
-
-| Stage | Name | Description |
-|-------|------|-------------|
-| 1 | Activity Scan | Scan all assets for activity scores |
-| 2 | Asset Selection | Select top N assets by activity |
-| 3 | Data Fetching | Fetch Options and Futures data |
-| 4 | Analysis | Run IV, PCR, OI, Max Pain analysis |
-| 5 | Whale/Wall Detection | Detect whale activity and OI walls |
-| 6 | Signal Generation | Create and output trading signals |
-
----
-
-## Troubleshooting
-
-### Issue: No Signals Generated
-
-**Symptoms:** Pipeline runs but outputs empty signals list
-
-**Possible causes:**
-1. No assets met minimum activity score
-2. All signals below minimum confidence threshold
-3. Missing or incomplete market data
-
-**Solutions:**
-```bash
-# Lower activity threshold
-# In config.yaml:
-# ranking.min_activity_score: 0.20
-
-# Lower confidence threshold
-python -m binance_signal_generator --min-confidence 0.40
-
-# Check with verbose output
-python -m binance_signal_generator -vv
-```
-
-### Issue: API Rate Limits
-
-**Symptoms:** Errors about rate limiting
-
-**Solutions:**
-```bash
-# Reduce rate in config.yaml:
-# binance.rate_limit.requests_per_second: 5
-
-# Or wait and retry
-python -m binance_signal_generator --config config.yaml
-```
-
-### Issue: Connection Timeout
-
-**Symptoms:** Connection errors or timeouts
-
-**Solutions:**
-```bash
-# Increase timeout in config.yaml:
-# binance.timeout.connect_seconds: 30
-# binance.timeout.read_seconds: 60
-```
 
 ---
 
@@ -693,4 +452,4 @@ For issues and feature requests, please refer to:
 
 ---
 
-*Last Updated: 2025-05-16*
+*Last Updated: 2026-05-17*

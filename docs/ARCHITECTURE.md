@@ -22,13 +22,13 @@ The Binance Options-Driven Futures Signal Generator follows a **layered architec
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
 │  │   OPTIONS    │  │    FUTURES   │  │    SIGNAL    │             │
 │  │   ANALYZER   │  │  VALIDATOR   │  │  GENERATOR   │             │
+│  │   + GEX      │  │  + Sentiment │  │              │             │
 │  └──────────────┘  └──────────────┘  └──────────────┘             │
 ├─────────────────────────────────────────────────────────────────────┤
 │                         INFRASTRUCTURE LAYER                        │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
 │  │  Binance SDK │  │   SQLite     │  │  YAML Config │             │
-│  │  (binance-   │  │   Storage    │  │   Loader     │             │
-│  │  connector)  │  │              │  │              │             │
+│  │  (official)  │  │   Storage    │  │   Loader     │             │
 │  └──────────────┘  └──────────────┘  └──────────────┘             │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -39,6 +39,8 @@ The Binance Options-Driven Futures Signal Generator follows a **layered architec
 Each module has one reason to change:
 - `options_fetcher.py` - Only fetches Options data
 - `iv_analyzer.py` - Only calculates implied volatility metrics
+- `gamma_exposure.py` - Only calculates GEX metrics
+- `sentiment.py` - Only analyzes market sentiment
 - `signal_generator.py` - Only produces final signals
 
 ### 2. Dependency Inversion
@@ -71,8 +73,11 @@ class BaseAnalyzer(ABC):
 class IVAnalyzer(BaseAnalyzer):
     def analyze(self, data: OptionsData) -> IVResult: ...
 
-class NewCustomAnalyzer(BaseAnalyzer):  # Extension
-    def analyze(self, data: OptionsData) -> CustomResult: ...
+class GammaExposureAnalyzer(BaseAnalyzer):  # NEW Extension
+    def analyze(self, data: OptionsData) -> GEXResult: ...
+
+class SentimentAnalyzer(BaseAnalyzer):  # NEW Extension
+    def analyze(self, data: FuturesData) -> SentimentResult: ...
 ```
 
 ## Component Diagram
@@ -115,26 +120,23 @@ class NewCustomAnalyzer(BaseAnalyzer):  # Extension
         ▼                                                          ▼
 ┌───────────────────┐                                    ┌────────────────┐
 │   DATA LAYER      │                                    │  OUTPUT LAYER  │
-│   (binance-connector SDK)                               │                │
+│   (Binance SDK)   │                                    │                │
 │ ┌───────────────┐ │                                    │ ┌────────────┐ │
 │ │OptionsFetcher │ │                                    │ │  SignalGen │ │
-│ │ (binance.     │ │                                    │ │            │ │
-│ │  options)     │ │                                    │ │ - create() │ │
-│ │               │ │                                    │ │ - calc_sl()│ │
-│ │ - get_chain() │ │                                    │ │ - calc_tp()│ │
-│ │ - get_oi()    │ │                                    │ └────────────┘ │
-│ │ - get_trades()│ │                                    │                │
-│ └───────────────┘ │                                    │ ┌────────────┐ │
-│                   │                                    │ │  Database  │ │
-│ ┌───────────────┐ │                                    │ │            │ │
-│ │FuturesFetcher │ │                                    │ │ - save()   │ │
-│ │ (binance.     │ │                                    │ │ - rotate() │ │
-│ │  um_futures)  │ │                                    │ │ - query()  │ │
-│ │               │ │                                    │ └────────────┘ │
-│ │ - get_price() │ │                                    └────────────────┘
-│ │ - get_oi()    │ │
-│ │ - get_fund()  │ │
-│ │ - get_klines()│ │
+│ │               │ │                                    │ │            │ │
+│ │ - get_chain() │ │                                    │ │ - create() │ │
+│ │ - get_oi()    │ │                                    │ │ - calc_sl()│ │
+│ │ - get_trades()│ │                                    │ │ - calc_tp()│ │
+│ └───────────────┘ │                                    │ └────────────┘ │
+│                   │                                    │                │
+│ ┌───────────────┐ │                                    │ ┌────────────┐ │
+│ │FuturesFetcher │ │                                    │ │  Database  │ │
+│ │               │ │                                    │ │            │ │
+│ │ - get_price() │ │                                    │ │ - save()   │ │
+│ │ - get_oi()    │ │                                    │ │ - rotate() │ │
+│ │ - get_fund()  │ │                                    │ │ - query()  │ │
+│ │ - get_ls_ratio│ │ ← NEW: Sentiment data              │ └────────────┘ │
+│ │ - get_klines()│ │                                    └────────────────┘
 │ └───────────────┘ │
 └───────────────────┘
 ```
@@ -150,14 +152,15 @@ class NewCustomAnalyzer(BaseAnalyzer):  # Extension
 │   ┌──────────────────┐                                              │
 │   │  Binance API     │                                              │
 │   │ ┌──────────────┐ │                                              │
-│   │ │ Options API  │ │  ← binance.options SDK                       │
+│   │ │ Options API  │ │  ← Options SDK                               │
 │   │ │ - /eapi/v1/  │ │                                              │
 │   │ │   public/... │ │                                              │
 │   │ └──────────────┘ │                                              │
 │   │ ┌──────────────┐ │                                              │
-│   │ │ Futures API  │ │  ← binance.um_futures SDK                    │
+│   │ │ Futures API  │ │  ← Futures SDK                               │
 │   │ │ - /fapi/v1/  │ │                                              │
-│   │ │   ...        │ │                                              │
+│   │ │ - /futures/  │ │  ← Sentiment APIs (L/S Ratios, Funding)      │
+│   │ │   data/...   │ │                                              │
 │   │ └──────────────┘ │                                              │
 │   └────────┬─────────┘                                              │
 │            │                                                        │
@@ -180,6 +183,7 @@ class NewCustomAnalyzer(BaseAnalyzer):  # Extension
 │   │  │ PCR Analyzer│           │   Checker   │                │   │
 │   │  │ OI Analyzer │           │  Trend      │                │   │
 │   │  │ MaxPain Calc│           │  Detector   │                │   │
+│   │  │ GEX Calc    │← NEW      │Sentiment Anl│← NEW           │   │
 │   │  └──────┬──────┘           └──────┬──────┘                │   │
 │   │         │                         │                       │   │
 │   │         ▼                         ▼                       │   │
@@ -204,24 +208,24 @@ class NewCustomAnalyzer(BaseAnalyzer):  # Extension
 
 ## SDK Integration Architecture
 
-The system uses the **official Binance Connector Python SDK** for reliable API interactions:
+The system uses the **official Binance Python SDK** for reliable API interactions:
 
 ```python
 # SDK initialization
-from binance.options import Options          # For Options API
-from binance.um_futures import UMFutures     # For USDT-M Futures
+from binance_sdk_derivatives_trading_usds_futures import DerivativesTradingUsdsFutures
+from binance_sdk_derivatives_trading_options import DerivativesTradingOptions
 
 # Options client
-options_client = Options(
-    key=api_key,
-    secret=api_secret,
+options_client = DerivativesTradingOptions(
+    api_key=api_key,
+    api_secret=api_secret,
     base_url='https://eapi.binance.com'      # Production
 )
 
 # Futures client  
-futures_client = UMFutures(
-    key=api_key,
-    secret=api_secret,
+futures_client = DerivativesTradingUsdsFutures(
+    api_key=api_key,
+    api_secret=api_secret,
     base_url='https://fapi.binance.com'      # Production
 )
 ```
@@ -238,9 +242,8 @@ futures_client = UMFutures(
 
 ### SDK References
 
-- **GitHub**: https://github.com/binance/binance-connector-python
-- **Options Client**: https://github.com/binance/binance-connector-python/tree/master/clients/derivatives_trading_options
-- **Futures Client**: https://github.com/binance/binance-connector-python/tree/master/clients/derivatives_trading_coin_futures
+- **Options SDK**: https://pypi.org/project/binance-sdk-derivatives-trading-options/
+- **Futures SDK**: https://pypi.org/project/binance-sdk-derivatives-trading-usds-futures/
 
 ## Error Handling Strategy
 
@@ -308,11 +311,47 @@ binance:
     burst: 20
 
 pipeline:
-  # Note: Scheduling handled externally via cronjob
   timeout:
     total_seconds: 600
     fetch_seconds: 120
     analysis_seconds: 180
+
+# NEW: Intraday configuration
+intraday:
+  enabled: true
+  oi_period: "15m"        # 5m, 15m, 1h, 4h
+  volume_interval: "15m"  # 5m, 15m, 1h, 4h
+  auto_mode: true         # Auto-select based on volatility
+
+# NEW: Asset-specific whale thresholds
+whale:
+  asset_thresholds:
+    BTCUSDT:
+      min_premium: 500000
+      block_threshold: 2000000
+    ETHUSDT:
+      min_premium: 200000
+      block_threshold: 1000000
+    default:
+      min_premium: 100000
+      block_threshold: 500000
+
+# NEW: Sentiment analysis settings
+sentiment:
+  ls_extreme_high: 2.0      # Contrarian signal threshold
+  ls_extreme_low: 0.5       # Contrarian signal threshold
+  funding_extreme_threshold: 0.001
+  use_contrarian: true
+  weights:
+    position_ratio: 0.4
+    account_ratio: 0.3
+    funding_rate: 0.3
+
+# NEW: Gamma exposure settings
+gamma_exposure:
+  enabled: true
+  significant_threshold: 0.05
+  include_in_sr: true
 
 analysis:
   options:
@@ -328,11 +367,6 @@ analysis:
     max_pain:
       enabled: true
       distance_threshold: 2.0  # %
-  futures:
-    liquidity:
-      min_24h_volume: 1000000
-    trend:
-      ema_period: 20
 
 output:
   json:
@@ -361,14 +395,119 @@ logging:
 |-------|-------------|------------|
 | Activity Scan | 30 seconds | Quick API calls for all assets |
 | Asset Selection | 10 seconds | Score and rank |
-| Data Fetch (Top 5) | 2 minutes | Full Options+Futures data |
-| Options Analysis | 3 minutes | IV, PCR, OI, MaxPain, Whale, Walls |
+| Data Fetch (Top 5) | 2 minutes | Full Options+Futures+Sentiment data |
+| Options Analysis | 3 minutes | IV, PCR, OI, MaxPain, GEX, Whale, Walls, Sentiment |
 | Signal Output | 1 minute | JSON output, SQLite save |
 | **Total** | **~7 minutes** | Single execution |
 
 ### Optimization Strategies
 
-1. **Parallel Data Fetching**: Fetch Options and Futures data concurrently
+1. **Parallel Data Fetching**: Fetch Options, Futures, and Sentiment data concurrently
 2. **Incremental Analysis**: Cache intermediate results
 3. **Lazy Loading**: Load heavy modules only when needed
 4. **Connection Pooling**: Reuse HTTP connections
+
+## New Modules Architecture
+
+### Gamma Exposure Module
+
+```python
+# binance_signal_generator/analysis/gamma_exposure.py
+
+@dataclass
+class GammaExposureResult:
+    """Result of gamma exposure analysis"""
+    total_gex: float           # Total gamma exposure
+    gex_regime: str            # POSITIVE, NEGATIVE, NEUTRAL
+    gamma_flip: float          # Price where GEX flips
+    support_levels: List[Dict] # Gamma-based support
+    resistance_levels: List[Dict]  # Gamma-based resistance
+    dealer_hedge_pressure: str  # BUY_DIPS, SELL_RIPS
+
+class GammaExposureCalculator:
+    """
+    Calculates dealer gamma exposure from options chain.
+    
+    Formula:
+        GEX = Σ (Gamma × OI × 100 × Spot² × 0.01)
+    
+    Interpretation:
+        - Positive GEX: Dealers buy dips, sell rips (stabilizing)
+        - Negative GEX: Dealers sell dips, buy rips (accelerating)
+    """
+    
+    def calculate(self, options_chain: OptionsChain) -> GammaExposureResult:
+        """Calculate GEX from options chain data."""
+        ...
+```
+
+### Sentiment Analysis Module
+
+```python
+# binance_signal_generator/analysis/sentiment.py
+
+@dataclass
+class SentimentResult:
+    """Result of sentiment analysis"""
+    position_ratio: float      # Top trader L/S position ratio
+    account_ratio: float       # Top trader L/S account ratio
+    funding_rate: float        # Current funding rate
+    funding_rate_avg_7d: float # 7-day average funding
+    funding_rate_extreme: bool # Is funding extreme?
+    combined_score: float      # Combined sentiment score (0-1)
+    signal: str                # LONG, SHORT, NEUTRAL
+    is_contrarian: bool        # Contrarian signal detected?
+
+class SentimentAnalyzer:
+    """
+    Analyzes market sentiment from top trader ratios and funding rates.
+    
+    Data Sources:
+        - Top Trader L/S Position Ratio (FREE API)
+        - Top Trader L/S Account Ratio (FREE API)
+        - Funding Rate History (Weight: 5)
+    
+    Signal Generation:
+        - Combined sentiment score from weighted inputs
+        - Contrarian signals at extreme readings
+    """
+    
+    def analyze(
+        self,
+        position_ratio: float,
+        account_ratio: float,
+        funding_rate: float,
+        funding_history: List[float]
+    ) -> SentimentResult:
+        """Calculate combined sentiment score."""
+        ...
+```
+
+### Asset-Specific Whale Detection
+
+```python
+# binance_signal_generator/whale/whale_detector.py
+
+class WhaleDetector:
+    """
+    Detects whale activity with asset-specific thresholds.
+    
+    Thresholds by Asset:
+        - BTC: $500k min, $2M block
+        - ETH: $200k min, $1M block
+        - Others: $100k min, $500k block
+    """
+    
+    ASSET_THRESHOLDS = {
+        'BTCUSDT': {'min_premium': 500000, 'block_threshold': 2000000},
+        'ETHUSDT': {'min_premium': 200000, 'block_threshold': 1000000},
+        'DEFAULT': {'min_premium': 100000, 'block_threshold': 500000}
+    }
+    
+    def get_thresholds(self, symbol: str) -> Dict:
+        """Get thresholds for specific asset."""
+        return self.ASSET_THRESHOLDS.get(
+            symbol, 
+            self.ASSET_THRESHOLDS['DEFAULT']
+        )
+```

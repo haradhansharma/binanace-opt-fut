@@ -165,14 +165,48 @@ class PipelineConfig:
 
 
 @dataclass
-class WhaleConfig:
-    """Whale detection configuration."""
+class IntradayConfig:
+    """Intraday data configuration for 15-min trading system."""
+    # Enable intraday mode
+    enabled: bool = True
+    
+    # Intraday OI settings
+    oi_period: str = "15m"  # For intraday OI momentum
+    oi_limit: int = 96  # 24 hours of 15-min data
+    
+    # Intraday volume settings
+    volume_interval: str = "15m"  # For volume spike detection
+    volume_limit: int = 48  # 12 hours for avg comparison
+    
+    # Price action settings
+    kline_interval: str = "15m"
+    kline_limit: int = 48  # 12 hours of candles
+    
+    # Scoring mode: "intraday" uses shorter timeframes, "daily" uses daily data
+    scoring_mode: str = "intraday"
+    
+    # Execution interval in minutes
+    execution_interval_minutes: int = 15
+
+
+@dataclass
+class AssetWhaleThreshold:
+    """Asset-specific whale detection thresholds."""
     min_premium: float = 100_000
     block_threshold: float = 500_000
+
+
+@dataclass
+class WhaleConfig:
+    """Whale detection configuration."""
+    min_premium: float = 100_000  # Default threshold
+    block_threshold: float = 500_000  # Default block threshold
     lookback_hours: int = 24
     confidence_boost_enabled: bool = True
     confidence_boost_max: float = 0.15
     confidence_boost_net_volume_threshold: float = 20_000_000
+    # Asset-specific thresholds (symbol -> thresholds)
+    asset_thresholds: Dict[str, AssetWhaleThreshold] = field(default_factory=dict)
 
 
 @dataclass
@@ -297,6 +331,7 @@ class Config:
     binance: BinanceConfig = field(default_factory=BinanceConfig)
     ranking: RankingConfig = field(default_factory=RankingConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
+    intraday: IntradayConfig = field(default_factory=IntradayConfig)
     whale: WhaleConfig = field(default_factory=WhaleConfig)
     walls: WallsConfig = field(default_factory=WallsConfig)
     analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
@@ -359,6 +394,9 @@ class Config:
         
         if "pipeline" in data:
             config.pipeline = cls._parse_pipeline(data["pipeline"])
+        
+        if "intraday" in data:
+            config.intraday = cls._parse_intraday(data["intraday"])
         
         if "whale" in data:
             config.whale = cls._parse_whale(data["whale"])
@@ -435,9 +473,32 @@ class Config:
         )
     
     @staticmethod
+    def _parse_intraday(data: Dict) -> IntradayConfig:
+        """Parse intraday section."""
+        return IntradayConfig(
+            enabled=data.get("enabled", True),
+            oi_period=data.get("oi_period", "15m"),
+            oi_limit=data.get("oi_limit", 96),
+            volume_interval=data.get("volume_interval", "15m"),
+            volume_limit=data.get("volume_limit", 48),
+            kline_interval=data.get("kline_interval", "15m"),
+            kline_limit=data.get("kline_limit", 48),
+            scoring_mode=data.get("scoring_mode", "intraday"),
+            execution_interval_minutes=data.get("execution_interval_minutes", 15),
+        )
+    
+    @staticmethod
     def _parse_whale(data: Dict) -> WhaleConfig:
         """Parse whale section."""
         boost = data.get("confidence_boost", {})
+        
+        # Parse asset-specific thresholds
+        asset_thresholds = {}
+        for asset, thresholds in data.get("asset_thresholds", {}).items():
+            asset_thresholds[asset] = AssetWhaleThreshold(
+                min_premium=thresholds.get("min_premium", 100_000),
+                block_threshold=thresholds.get("block_threshold", 500_000),
+            )
         
         return WhaleConfig(
             min_premium=data.get("min_premium", 100_000),
@@ -446,6 +507,7 @@ class Config:
             confidence_boost_enabled=boost.get("enabled", True),
             confidence_boost_max=boost.get("max_boost", 0.15),
             confidence_boost_net_volume_threshold=boost.get("net_volume_threshold", 20_000_000),
+            asset_thresholds=asset_thresholds,
         )
     
     @staticmethod

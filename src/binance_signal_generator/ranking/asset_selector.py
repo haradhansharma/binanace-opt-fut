@@ -28,8 +28,8 @@ logger = get_logger(__name__)
 class SelectionConfig:
     """Configuration for asset selection."""
     top_n: int = 5
-    min_activity_score: float = 0.30
-    min_options_volume: float = 1_000_000  # $1M minimum
+    min_activity_score: float = 0.15  # Lowered from 0.30 to allow more assets
+    min_options_volume: float = 100_000  # $100K minimum (lowered from $1M)
     min_active_strikes: int = 5
     excluded_symbols: Set[str] = None
     

@@ -137,28 +137,53 @@ class MaxPainCalculator:
     ) -> Dict[float, float]:
         """
         Calculate pain value at each strike.
-        
+
         Pain = Sum of intrinsic values of all options at that strike.
         Higher pain = more option holders lose money if price reaches that strike.
-        
+
+        Note: We limit test strikes to ±30% of spot price to avoid skewing
+        the calculation with extreme OTM strikes that have minimal relevance
+        for trading signals.
+
         Args:
             chain: Options chain
-            
+
         Returns:
             Dictionary mapping strike to pain value
         """
         pain_by_strike = {}
-        
+
         # Get sorted strikes
-        strikes = sorted(chain.strikes.keys())
-        
-        if not strikes:
+        all_strikes = sorted(chain.strikes.keys())
+
+        if not all_strikes:
             return {}
-        
-        # For each potential settlement price (each strike)
-        for test_strike in strikes:
+
+        # Filter strikes to reasonable range around spot price (±30%)
+        # This prevents extreme OTM strikes from skewing the max pain calculation
+        spot = chain.spot_price
+        min_strike = spot * 0.70  # 30% below spot
+        max_strike = spot * 1.30  # 30% above spot
+
+        test_strikes = [s for s in all_strikes if min_strike <= s <= max_strike]
+
+        # If no strikes in range, fall back to all strikes
+        if not test_strikes:
+            test_strikes = all_strikes
+            logger.warning(
+                f"No strikes within ±30% of spot ({spot}) for max pain calculation. "
+                f"Using all {len(all_strikes)} strikes."
+            )
+
+        logger.debug(
+            f"Max pain: testing {len(test_strikes)}/{len(all_strikes)} strikes "
+            f"(range: {min(test_strikes):.0f} - {max(test_strikes):.0f}, spot: {spot:.0f})"
+        )
+
+        # For each potential settlement price (each strike in range)
+        for test_strike in test_strikes:
             total_pain = 0.0
-            
+
             for strike_price, strike_data in chain.strikes.items():
                 # Calculate call pain
                 # Call holders lose if test_strike < strike_price
@@ -167,7 +192,7 @@ class MaxPainCalculator:
                     call_pain = (strike_price - test_strike) * strike_data.call.open_interest
                 else:
                     call_pain = 0
-                
+
                 # Calculate put pain
                 # Put holders lose if test_strike > strike_price
                 # Pain = max(test_strike - strike, 0) * OI
@@ -175,11 +200,11 @@ class MaxPainCalculator:
                     put_pain = (test_strike - strike_price) * strike_data.put.open_interest
                 else:
                     put_pain = 0
-                
+
                 total_pain += call_pain + put_pain
-            
+
             pain_by_strike[test_strike] = total_pain
-        
+
         return pain_by_strike
     
     def _calculate_component_pain(

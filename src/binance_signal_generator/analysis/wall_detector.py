@@ -29,17 +29,20 @@ logger = get_logger(__name__)
 class WallDetectorConfig:
     """Configuration for wall detection."""
     # OI concentration threshold
-    # Lowered from 10% to 5% for better detection since OI is distributed across many strikes
-    min_oi_concentration: float = 0.05   # 5% of total OI
-    
-    # Major wall threshold
-    major_wall_concentration: float = 0.15  # 15% of total OI (lowered from 20%)
-    
+    # ANALYSIS: With ~18K total OI across 70+ strikes for BTC, OI is very distributed.
+    # Max single-strike OI observed: ~121 contracts (0.67% of total)
+    # Previous threshold of 2% (361 contracts) was too high - no walls detected.
+    # New threshold: 0.5% allows strikes with ~90+ contracts to be detected.
+    min_oi_concentration: float = 0.005   # 0.5% of total OI (lowered from 2%)
+
+    # Major wall threshold - also lowered proportionally
+    major_wall_concentration: float = 0.02  # 2% of total OI (lowered from 10%)
+
     # Distance from spot (in %)
     max_wall_distance: float = 15.0  # 15% from spot
-    
-    # Minimum absolute OI
-    min_absolute_oi: int = 50  # Lowered from 100 for better detection
+
+    # Minimum absolute OI - lowered to catch smaller but significant walls
+    min_absolute_oi: int = 25  # Lowered from 50 for better detection
 
 
 class WallDetector:
@@ -92,8 +95,14 @@ class WallDetector:
         """
         total_oi = chain.total_call_oi + chain.total_put_oi
         
+        logger.info(
+            f"Wall detection for {chain.underlying}: total_oi={total_oi}, "
+            f"call_oi={chain.total_call_oi}, put_oi={chain.total_put_oi}, "
+            f"strikes={len(chain.strikes)}, spot={chain.spot_price}"
+        )
+        
         if total_oi < self.config.min_absolute_oi:
-            logger.warning(f"Insufficient OI for wall detection: {total_oi}")
+            logger.warning(f"Insufficient total OI for wall detection: {total_oi} < {self.config.min_absolute_oi}")
             return self._create_empty_analysis(chain)
         
         # Detect call walls (above spot - resistance)
@@ -167,6 +176,12 @@ class WallDetector:
         spot = chain.spot_price
         max_distance = spot * (self.config.max_wall_distance / 100)
         
+        # Track potential walls for debug
+        candidates = 0
+        filtered_distance = 0
+        filtered_oi = 0
+        filtered_concentration = 0
+        
         for strike_price, strike_data in chain.strikes.items():
             # Only consider strikes above spot
             if strike_price <= spot:
@@ -174,17 +189,22 @@ class WallDetector:
             
             # Check distance
             if strike_price - spot > max_distance:
+                filtered_distance += 1
                 continue
             
             call_oi = strike_data.call.open_interest
             
             if call_oi < self.config.min_absolute_oi:
+                filtered_oi += 1
                 continue
+            
+            candidates += 1
             
             # Calculate concentration
             concentration = call_oi / total_oi
             
             if concentration < self.config.min_oi_concentration:
+                filtered_concentration += 1
                 continue
             
             # Create wall
@@ -207,6 +227,12 @@ class WallDetector:
         # Sort by strength
         walls.sort(key=lambda w: w.strength_score, reverse=True)
         
+        logger.debug(
+            f"Call wall detection: {candidates} candidates, "
+            f"{len(walls)} walls found (filtered: {filtered_distance} distance, "
+            f"{filtered_oi} low_oi, {filtered_concentration} low_concentration)"
+        )
+        
         return walls
     
     def _detect_put_walls(
@@ -228,6 +254,12 @@ class WallDetector:
         spot = chain.spot_price
         max_distance = spot * (self.config.max_wall_distance / 100)
         
+        # Track potential walls for debug
+        candidates = 0
+        filtered_distance = 0
+        filtered_oi = 0
+        filtered_concentration = 0
+        
         for strike_price, strike_data in chain.strikes.items():
             # Only consider strikes below spot
             if strike_price >= spot:
@@ -235,17 +267,22 @@ class WallDetector:
             
             # Check distance
             if spot - strike_price > max_distance:
+                filtered_distance += 1
                 continue
             
             put_oi = strike_data.put.open_interest
             
             if put_oi < self.config.min_absolute_oi:
+                filtered_oi += 1
                 continue
+            
+            candidates += 1
             
             # Calculate concentration
             concentration = put_oi / total_oi
             
             if concentration < self.config.min_oi_concentration:
+                filtered_concentration += 1
                 continue
             
             # Create wall
@@ -267,6 +304,12 @@ class WallDetector:
         
         # Sort by strength
         walls.sort(key=lambda w: w.strength_score, reverse=True)
+        
+        logger.debug(
+            f"Put wall detection: {candidates} candidates, "
+            f"{len(walls)} walls found (filtered: {filtered_distance} distance, "
+            f"{filtered_oi} low_oi, {filtered_concentration} low_concentration)"
+        )
         
         return walls
     

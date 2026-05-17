@@ -12,7 +12,7 @@ Whale Definition:
 
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import defaultdict
 import re
 
@@ -29,9 +29,16 @@ logger = get_logger(__name__)
 
 
 @dataclass
+class AssetWhaleThreshold:
+    """Asset-specific whale thresholds."""
+    min_premium: float = 100_000
+    block_threshold: float = 500_000
+
+
+@dataclass
 class WhaleDetectorConfig:
     """Configuration for whale detection."""
-    # Premium thresholds
+    # Default premium thresholds (used when no asset-specific threshold)
     min_premium: float = 100_000       # $100k for regular whale
     block_threshold: float = 500_000   # $500k for block trade
     
@@ -42,6 +49,10 @@ class WhaleDetectorConfig:
     # Sentiment thresholds
     bullish_threshold: float = 0.3     # 30% net bullish = bullish
     bearish_threshold: float = -0.3    # 30% net bearish = bearish
+    
+    # Asset-specific thresholds
+    # Key: symbol (e.g., "BTCUSDT"), Value: AssetWhaleThreshold
+    asset_thresholds: Dict[str, AssetWhaleThreshold] = field(default_factory=dict)
 
 
 class WhaleDetector:
@@ -80,8 +91,27 @@ class WhaleDetector:
                 "min_premium": self.config.min_premium,
                 "block_threshold": self.config.block_threshold,
                 "lookback_hours": self.config.lookback_hours,
+                "asset_specific_count": len(self.config.asset_thresholds),
             }}
         )
+    
+    def _get_thresholds_for_asset(self, symbol: str) -> Tuple[float, float]:
+        """
+        Get whale thresholds for a specific asset.
+        
+        Args:
+            symbol: Asset symbol (e.g., "BTCUSDT")
+            
+        Returns:
+            Tuple of (min_premium, block_threshold)
+        """
+        # Check for asset-specific thresholds
+        if symbol in self.config.asset_thresholds:
+            threshold = self.config.asset_thresholds[symbol]
+            return threshold.min_premium, threshold.block_threshold
+        
+        # Return defaults
+        return self.config.min_premium, self.config.block_threshold
     
     def analyze(
         self,
@@ -122,34 +152,42 @@ class WhaleDetector:
     def _filter_whale_trades(
         self,
         trades: List[Dict[str, Any]],
+        symbol: Optional[str] = None,
     ) -> List[WhaleTrade]:
         """
         Filter trades to identify whale trades.
         
         Args:
             trades: List of recent trades
+            symbol: Optional symbol for asset-specific thresholds
             
         Returns:
             List of WhaleTrade objects
         """
         whale_trades = []
         
+        # Get thresholds for this asset
+        min_premium, block_threshold = self._get_thresholds_for_asset(symbol) if symbol else (
+            self.config.min_premium, self.config.block_threshold
+        )
+        
         for trade in trades:
             premium = trade.get("premium", trade.get("quote_qty", 0))
             
-            if premium >= self.config.min_premium:
-                whale_trade = self._parse_trade(trade)
+            if premium >= min_premium:
+                whale_trade = self._parse_trade(trade, block_threshold)
                 if whale_trade:
                     whale_trades.append(whale_trade)
         
         return whale_trades
     
-    def _parse_trade(self, trade: Dict[str, Any]) -> Optional[WhaleTrade]:
+    def _parse_trade(self, trade: Dict[str, Any], block_threshold: Optional[float] = None) -> Optional[WhaleTrade]:
         """
         Parse raw trade data into WhaleTrade object.
         
         Args:
             trade: Raw trade dictionary
+            block_threshold: Optional custom block threshold
             
         Returns:
             WhaleTrade object or None
@@ -166,8 +204,9 @@ class WhaleDetector:
             # Get premium
             premium = trade.get("premium", trade.get("quote_qty", 0))
             
-            # Determine if block trade
-            is_block = premium >= self.config.block_threshold
+            # Determine if block trade (use provided threshold or default)
+            threshold = block_threshold if block_threshold is not None else self.config.block_threshold
+            is_block = premium >= threshold
             
             # Determine trade direction
             direction = trade.get("side", trade.get("direction", "UNKNOWN"))
@@ -479,17 +518,12 @@ class WhaleDetector:
         This method is specifically for the block trades API which returns
         all block trades (not filtered by symbol). We filter by underlying.
         
-        IMPORTANT: The quoteQty from Binance API is in BASE CURRENCY (BTC, ETH, etc.),
-        NOT in USD. We need to multiply by spot price to get USD value.
-        
-        Example from API:
-        {"symbol": "ETH-260522-2200-C", "price": "45.2", "qty": "0.01", "quoteQty": "0.452"}
-        - quoteQty = 0.452 ETH (not $0.452!)
-        - Real USD value = 0.452 ETH × $2,400 = $1,084.80
+        For USDT-margined options, the quoteQty/amount should already be in USDT.
+        No conversion needed.
         
         Args:
             block_trades: List of block trades from API (all symbols)
-            options_chain: Current options chain for context (includes spot_price)
+            options_chain: Current options chain for context
             
         Returns:
             WhaleAnalysis with whale metrics
@@ -497,8 +531,8 @@ class WhaleDetector:
         # Extract base asset (BTCUSDT -> BTC)
         base = options_chain.underlying.replace("USDT", "").replace("BUSD", "")
         
-        # Get spot price for USD conversion
-        spot_price = options_chain.spot_price
+        # Get asset-specific thresholds
+        min_premium, block_threshold = self._get_thresholds_for_asset(options_chain.underlying)
         
         # Filter trades for this underlying
         underlying_trades = [
@@ -510,21 +544,34 @@ class WhaleDetector:
             logger.debug(f"No block trades found for {options_chain.underlying}")
             return self._create_empty_analysis(options_chain.underlying)
         
-        # Calculate total premium in USD and identify larger trades
-        # quoteQty is in base currency (BTC, ETH), need to convert to USD
+        # Log sample trade and thresholds used
+        logger.debug(
+            f"Whale analysis for {options_chain.underlying}: "
+            f"trades={len(underlying_trades)}, min_premium=${min_premium:,.0f}, "
+            f"block_threshold=${block_threshold:,.0f}"
+        )
+        
+        # Log sample trade to understand API response format
+        if underlying_trades:
+            logger.debug(f"Sample block trade for {options_chain.underlying}: {underlying_trades[0]}")
+        
+        # Calculate total premium - for USDT-margined options, already in USDT
         premiums_usd = []
         for trade in underlying_trades:
-            # quoteQty is the premium in BASE CURRENCY (BTC, ETH, etc.)
-            quote_qty = abs(float(trade.get("quoteQty", 0) or 0))
+            # Try multiple field name variations
+            quote_qty = (
+                trade.get("quoteQty") or
+                trade.get("quote_qty") or
+                trade.get("amount") or
+                trade.get("premium") or
+                trade.get("value") or
+                trade.get("total") or
+                0
+            )
+            quote_qty = abs(float(quote_qty) if quote_qty else 0)
             
-            # Convert to USD by multiplying by spot price
-            if spot_price > 0:
-                premium_usd = quote_qty * spot_price
-            else:
-                # Fallback: estimate from price × qty if no spot price
-                price = float(trade.get("price", 0) or 0)
-                qty = float(trade.get("qty", 0) or 0)
-                premium_usd = price * qty
+            # For USDT-margined options, already in USDT
+            premium_usd = quote_qty
             
             premiums_usd.append(premium_usd)
         
@@ -532,9 +579,9 @@ class WhaleDetector:
         avg_premium_usd = total_premium_usd / len(premiums_usd) if premiums_usd else 0
         max_premium_usd = max(premiums_usd) if premiums_usd else 0
         
-        # Determine "whale" trades as those above average
+        # Determine "whale" trades using asset-specific threshold
         # (since block trades are already filtered for size by the exchange)
-        whale_threshold = max(avg_premium_usd, 100)  # At least $100 or above average
+        whale_threshold = max(min_premium, avg_premium_usd)  # Use asset-specific or average
         
         # Analyze direction based on option type and side
         call_premium_usd = 0.0
@@ -544,16 +591,21 @@ class WhaleDetector:
         
         for trade in underlying_trades:
             symbol = trade.get("symbol", "")
-            quote_qty = abs(float(trade.get("quoteQty", 0) or 0))
+            # Try multiple field name variations for premium
+            quote_qty = (
+                trade.get("quoteQty") or
+                trade.get("quote_qty") or
+                trade.get("amount") or
+                trade.get("premium") or
+                trade.get("value") or
+                trade.get("total") or
+                0
+            )
+            quote_qty = abs(float(quote_qty) if quote_qty else 0)
             side = trade.get("side", 0)  # -1 = sell, 1 = buy
             
-            # Convert to USD
-            if spot_price > 0:
-                premium_usd = quote_qty * spot_price
-            else:
-                price = float(trade.get("price", 0) or 0)
-                qty = float(trade.get("qty", 0) or 0)
-                premium_usd = price * qty
+            # For USDT-margined options, already in USDT
+            premium_usd = quote_qty
             
             # Determine option type
             if "-C" in symbol:
@@ -601,7 +653,7 @@ class WhaleDetector:
         logger.debug(
             f"Block trade analysis for {options_chain.underlying}: "
             f"trades={len(underlying_trades)}, total_premium=${total_premium_usd:.0f}, "
-            f"net_direction={net_direction}, activity_score={activity_score:.3f}, spot=${spot_price:.2f}"
+            f"net_direction={net_direction}, activity_score={activity_score:.3f}"
         )
         
         return WhaleAnalysis(

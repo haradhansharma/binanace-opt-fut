@@ -27,6 +27,7 @@ from binance_signal_generator.models import (
     StrikeData,
     OptionData,
     ActivityMetrics,
+    ExerciseRecord,
 )
 from binance_signal_generator.utils.rate_limiter import RateLimiter
 from binance_signal_generator.utils.logging import get_logger
@@ -258,35 +259,49 @@ class OptionsFetcher:
     ) -> List[Any]:
         """
         Get open interest for an underlying asset.
-        
+
         API: GET /eapi/v1/openInterest
-        
+        NOTE: Both underlyingAsset and expiration are REQUIRED parameters.
+
+        Response format:
+        [
+            {
+                "symbol": "ETH-221119-1175-P",
+                "sumOpenInterest": "4.01",
+                "sumOpenInterestUsd": "4880.2985615624",
+                "timestamp": "1668754020000"
+            }
+        ]
+
         Args:
             underlying: Underlying asset (e.g., "BTC" for BTCUSDT)
-            expiration: Expiration date string (e.g., "260626")
-            
+            expiration: Expiration date string (e.g., "260626") - REQUIRED
+
         Returns:
             List of OpenInterestResponse objects
         """
         await self.rate_limiter.acquire()
-        
+
         try:
             # Convert underlying format (BTCUSDT -> BTC)
             base = underlying.replace("USDT", "").replace("BUSD", "")
-            
-            if expiration:
-                response = self.client.rest_api.open_interest(
-                    underlying_asset=base,
-                    expiration=expiration,
+
+            # CRITICAL: expiration is REQUIRED by the Binance API
+            # The API will error if expiration is not provided
+            if not expiration:
+                logger.warning(
+                    f"OpenInterest API requires 'expiration' parameter for {underlying}. "
+                    f"Use get_all_open_interest_for_underlying() to fetch all expirations."
                 )
-            else:
-                # Get all expirations
-                response = self.client.rest_api.open_interest(
-                    underlying_asset=base,
-                )
-            
+                return []
+
+            response = self.client.rest_api.open_interest(
+                underlying_asset=base,
+                expiration=expiration,
+            )
+
             data = response.data()
-            
+
             # API returns a list of OpenInterestResponse objects
             if isinstance(data, list):
                 return data
@@ -295,7 +310,7 @@ class OptionsFetcher:
             else:
                 logger.warning(f"Unexpected OI response type: {type(data)}")
                 return []
-            
+
         except Exception as e:
             logger.error(f"Failed to fetch open interest for {underlying}: {e}")
             return []
@@ -330,16 +345,26 @@ class OptionsFetcher:
             
             # Fetch OI for each expiration
             oi_map: Dict[str, float] = {}
-            
+
             for expiry in sorted(expirations):
                 oi_list = await self.get_open_interest_for_underlying(underlying, expiry)
-                
+
                 # Process each item in the list
+                # API returns: {"symbol": "ETH-221119-1175-P", "sumOpenInterest": "4.01", ...}
                 for item in oi_list:
-                    if hasattr(item, 'symbol') and hasattr(item, 'sum_open_interest'):
+                    # Handle SDK object with actual_instance wrapper
+                    if hasattr(item, 'actual_instance'):
+                        item = item.actual_instance
+
+                    if hasattr(item, 'symbol'):
                         # SDK returns OpenInterestResponse objects
-                        symbol = item.symbol
-                        oi_str = item.sum_open_interest
+                        symbol = getattr(item, 'symbol', '')
+                        # Try both snake_case and camelCase field names
+                        oi_str = (
+                            getattr(item, 'sum_open_interest', None) or
+                            getattr(item, 'sumOpenInterest', None) or
+                            "0"
+                        )
                         try:
                             oi = float(oi_str) if oi_str else 0.0
                         except (ValueError, TypeError):
@@ -349,14 +374,14 @@ class OptionsFetcher:
                     elif isinstance(item, dict):
                         # Handle dict format (fallback)
                         symbol = item.get("symbol", "")
-                        oi_str = item.get("sum_open_interest") or item.get("openInterest", "0")
+                        oi_str = item.get("sumOpenInterest") or item.get("sum_open_interest") or item.get("openInterest", "0")
                         try:
                             oi = float(oi_str) if oi_str else 0.0
                         except (ValueError, TypeError):
                             oi = 0.0
                         if symbol:
                             oi_map[symbol] = oi
-            
+
             logger.info(f"Fetched OI data for {len(oi_map)} symbols for {underlying}")
             return oi_map
             
@@ -843,7 +868,9 @@ class OptionsFetcher:
                         put=OptionData(),
                     )
                 
-                # Use 'amount' (total traded value) as volume proxy
+                # Use 'amount' (total traded value in USDT) as volume proxy
+                # For USDT-margined options, 'amount' is already in USDT
+                # No conversion needed
                 volume_value = amount if amount > 0 else volume * last_price
                 
                 if side == "CALL":
@@ -886,54 +913,61 @@ class OptionsFetcher:
             logger.error(f"Failed to build options chain for {underlying}: {e}")
             raise DataFetchError(f"Options chain build failed for {underlying}: {e}")
     
-    async def get_activity_summary(self, underlying: str) -> ActivityMetrics:
+    async def get_activity_summary(
+        self,
+        underlying: str,
+        oi_change_pct: float = 0.0,
+        volume_spike_score: float = 0.0,
+    ) -> ActivityMetrics:
         """
         Get quick activity summary for asset ranking.
-        
+
         Combines multiple lightweight API calls to provide
         activity metrics for ranking.
-        
+
         Args:
             underlying: Underlying symbol
-            
+            oi_change_pct: OI change percentage from historical API (/futures/data/openInterestHist)
+            volume_spike_score: Volume spike score from historical API (/fapi/v1/klines)
+
         Returns:
             ActivityMetrics for the underlying
         """
         try:
             # Fetch option chain for comprehensive data
             chain = await self.get_option_chain(underlying)
-            
+
             # Get block trades for whale activity
             block_trades = await self.get_block_trades(limit=500)
-            
+
             # Calculate whale activity from block trades (pass spot price for USD conversion)
             whale_activity = self._calculate_whale_activity(underlying, block_trades, chain.spot_price)
-            
+
             # Calculate metrics
             total_oi = chain.total_call_oi + chain.total_put_oi
             total_volume = chain.total_call_volume + chain.total_put_volume
-            active_strikes = len([s for s in chain.strikes.values() 
+            active_strikes = len([s for s in chain.strikes.values()
                                  if s.call.open_interest > 0 or s.put.open_interest > 0])
-            
+
             # Calculate PCR extremeness
             pcr = chain.get_pcr()
             pcr_extremeness = self._calc_pcr_extremeness(pcr)
-            
+
             # Calculate IV percentile from real data
             iv_percentile = self._calc_iv_percentile(chain)
-            
+
             return ActivityMetrics(
                 symbol=underlying,
                 timestamp=datetime.utcnow(),
-                oi_change_pct=0.0,  # Requires historical data
-                volume_spike_score=0.0,  # Requires historical data
+                oi_change_pct=oi_change_pct,  # From /futures/data/openInterestHist
+                volume_spike_score=volume_spike_score,  # From /fapi/v1/klines
                 iv_percentile=iv_percentile,
                 pcr_extremeness=pcr_extremeness,
                 whale_activity=whale_activity,
                 total_options_volume=total_volume,
                 num_strikes_active=active_strikes,
             )
-            
+
         except Exception as e:
             logger.error(f"Failed to get activity summary for {underlying}: {e}")
             # Return empty metrics on failure
@@ -978,22 +1012,31 @@ class OptionsFetcher:
             return 0.0
         
         # Calculate total premium traded in USD
-        # quoteQty is in base currency (BTC, ETH), need to convert to USD
+        # For USDT-margined options, values should already be in USDT
+        # Log sample trade to understand API response format
+        if underlying_trades:
+            sample_trade = underlying_trades[0]
+            logger.debug(f"Sample block trade for {underlying}: {sample_trade}")
+        
         total_premium_usd = 0.0
         large_trades = 0
         
         for trade in underlying_trades:
-            # quoteQty is the premium in BASE CURRENCY (BTC, ETH, etc.)
-            quote_qty = abs(float(trade.get("quoteQty", 0) or 0))
+            # For USDT-margined options, quoteQty should be in USDT
+            # Try multiple field name variations
+            quote_qty = (
+                trade.get("quoteQty") or
+                trade.get("quote_qty") or
+                trade.get("amount") or
+                trade.get("premium") or
+                trade.get("value") or
+                trade.get("total") or
+                0
+            )
+            quote_qty = abs(float(quote_qty) if quote_qty else 0)
             
-            # Convert to USD by multiplying by spot price
-            if spot_price > 0:
-                premium_usd = quote_qty * spot_price
-            else:
-                # Fallback: estimate from price × qty if no spot price
-                price = float(trade.get("price", 0) or 0)
-                qty = float(trade.get("qty", 0) or 0)
-                premium_usd = price * qty
+            # For USDT-margined options, no conversion needed - already in USDT
+            premium_usd = quote_qty
             
             total_premium_usd += premium_usd
             
@@ -1015,7 +1058,7 @@ class OptionsFetcher:
         
         logger.debug(
             f"Whale activity for {underlying}: {whale_score:.3f} "
-            f"(trades={len(underlying_trades)}, premium=${total_premium_usd:.0f}, large={large_trades}, spot=${spot_price:.2f})"
+            f"(trades={len(underlying_trades)}, premium=${total_premium_usd:.0f}, large={large_trades})"
         )
         
         return whale_score
@@ -1074,6 +1117,109 @@ class OptionsFetcher:
         else:
             return 0.95  # Very high IV
     
+    async def get_historical_exercise_records(
+        self,
+        underlying: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 100,
+    ) -> List[ExerciseRecord]:
+        """
+        Get historical exercise records.
+        
+        API: GET /eapi/v1/exerciseHistory
+        Weight: 3
+        
+        Shows which options were exercised (ITM at expiry) vs expired OTM.
+        Useful for validating max pain theory - options often expire near max pain.
+        
+        Response format:
+        [
+            {
+                "symbol": "BTC-220121-60000-P",
+                "strikePrice": "60000",
+                "realStrikePrice": "38844.69652571",
+                "expiryDate": 1642752000000,
+                "strikeResult": "REALISTIC_VALUE_STRICKEN"
+            }
+        ]
+        
+        Strike Results:
+        - REALISTIC_VALUE_STRICKEN: Exercised (was ITM at expiry)
+        - EXTRINSIC_VALUE_EXPIRED: Expired OTM (worthless)
+        
+        Args:
+            underlying: Underlying index like BTCUSDT (optional)
+            start_time: Start timestamp in ms (optional)
+            end_time: End timestamp in ms (optional)
+            limit: Number of records (default 100, max 100)
+            
+        Returns:
+            List of ExerciseRecord objects
+        """
+        await self.rate_limiter.acquire()
+        
+        try:
+            params = {"limit": min(limit, 100)}
+            if underlying:
+                params["underlying"] = underlying
+            if start_time:
+                params["startTime"] = start_time
+            if end_time:
+                params["endTime"] = end_time
+            
+            response = self.client.rest_api.historical_exercise_records(**params)
+            data = response.data()
+            
+            # Handle response
+            if data is None:
+                logger.warning("Historical exercise records response is None")
+                return []
+            
+            # Convert to list
+            if isinstance(data, list):
+                items = data
+            elif hasattr(data, '__iter__') and not isinstance(data, dict):
+                items = list(data)
+            else:
+                items = [data] if data else []
+            
+            # Parse into ExerciseRecord objects
+            result = []
+            for item in items:
+                if hasattr(item, '__dict__'):
+                    timestamp_ms = int(getattr(item, 'expiry_date', 0) or getattr(item, 'expiryDate', 0) or 0)
+                    result.append(ExerciseRecord(
+                        symbol=getattr(item, 'symbol', ''),
+                        strike_price=float(getattr(item, 'strike_price', 0) or getattr(item, 'strikePrice', 0) or 0),
+                        real_strike_price=float(getattr(item, 'real_strike_price', 0) or getattr(item, 'realStrikePrice', 0) or 0),
+                        expiry_date=datetime.fromtimestamp(timestamp_ms / 1000) if timestamp_ms else datetime.utcnow(),
+                        strike_result=getattr(item, 'strike_result', '') or getattr(item, 'strikeResult', '') or '',
+                    ))
+                elif isinstance(item, dict):
+                    timestamp_ms = int(item.get("expiryDate", 0) or 0)
+                    result.append(ExerciseRecord(
+                        symbol=item.get("symbol", ""),
+                        strike_price=float(item.get("strikePrice", 0) or 0),
+                        real_strike_price=float(item.get("realStrikePrice", 0) or 0),
+                        expiry_date=datetime.fromtimestamp(timestamp_ms / 1000) if timestamp_ms else datetime.utcnow(),
+                        strike_result=item.get("strikeResult", ""),
+                    ))
+            
+            logger.debug(
+                f"Fetched {len(result)} exercise records",
+                extra={"data": {
+                    "underlying": underlying,
+                    "exercised": sum(1 for r in result if r.strike_result == "REALISTIC_VALUE_STRICKEN"),
+                    "expired_otm": sum(1 for r in result if r.strike_result == "EXTRINSIC_VALUE_EXPIRED"),
+                }}
+            )
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch historical exercise records: {e}")
+            return []
+
     async def close(self) -> None:
         """Close the client connection."""
         logger.info("Options fetcher closed")

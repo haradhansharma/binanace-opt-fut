@@ -26,6 +26,8 @@ from binance_signal_generator.ranking.asset_selector import AssetSelector, Selec
 from binance_signal_generator.analysis.signal_scorer import SignalScorer
 from binance_signal_generator.whale.whale_detector import WhaleDetector, WhaleDetectorConfig
 from binance_signal_generator.analysis.wall_detector import WallDetector, WallDetectorConfig
+from binance_signal_generator.analysis.gamma_exposure import GammaExposureCalculator, GammaExposureConfig
+from binance_signal_generator.analysis.sentiment import SentimentAnalyzer, SentimentConfig
 from binance_signal_generator.output.sr_levels import SRLevelCalculator, SRLevelConfig
 from binance_signal_generator.models import (
     OptionsChain,
@@ -137,10 +139,24 @@ class PipelineOrchestrator:
         )
         self.signal_scorer = SignalScorer()
         
-        # Initialize whale and wall detectors
-        self.whale_detector = WhaleDetector(WhaleDetectorConfig())
+        # Initialize whale detector with config thresholds
+        whale_config = WhaleDetectorConfig(
+            min_premium=config.whale.min_premium,
+            block_threshold=config.whale.block_threshold,
+            lookback_hours=config.whale.lookback_hours,
+            asset_thresholds=config.whale.asset_thresholds,
+        )
+        self.whale_detector = WhaleDetector(whale_config)
+        
+        # Initialize wall detector
         self.wall_detector = WallDetector(WallDetectorConfig())
         self.sr_calculator = SRLevelCalculator(SRLevelConfig())
+        
+        # Initialize gamma exposure calculator
+        self.gamma_calculator = GammaExposureCalculator(GammaExposureConfig())
+        
+        # Initialize sentiment analyzer for L/S ratios and funding rates
+        self.sentiment_analyzer = SentimentAnalyzer(SentimentConfig())
         
         # Execution tracking
         self._api_calls_made = 0
@@ -242,55 +258,174 @@ class PipelineOrchestrator:
     async def _run_activity_scan(self) -> List[RankedAsset]:
         """
         Run activity scan to select top assets.
-        
+
         Returns:
             List of selected RankedAsset
         """
         logger.info("Starting activity scan")
-        
+
         try:
             # Get available underlyings
             underlyings = await self.options_fetcher.get_available_underlyings()
             self._api_calls_made += 1
-            
+
             logger.info(f"Found {len(underlyings)} underlyings")
-            
+
             # Fetch activity metrics for each
             metrics_list: List[ActivityMetrics] = []
-            
+
             # Process in batches to avoid rate limits
             batch_size = 10
             for i in range(0, min(len(underlyings), 50), batch_size):
                 batch = underlyings[i:i + batch_size]
-                
-                tasks = [
-                    self.options_fetcher.get_activity_summary(underlying)
-                    for underlying in batch
-                ]
-                
+
+                # Fetch historical data for batch (OI change and volume spike)
+                # This recovers the missing 45% of scoring weight!
+                historical_data_tasks = []
+                for underlying in batch:
+                    historical_data_tasks.append(self._fetch_historical_data(underlying))
+
+                historical_results = await asyncio.gather(*historical_data_tasks, return_exceptions=True)
+
+                # Create tasks with historical data
+                tasks = []
+                for j, underlying in enumerate(batch):
+                    hist_data = historical_results[j]
+                    if isinstance(hist_data, Exception):
+                        logger.debug(f"Historical data fetch failed for {underlying}: {hist_data}")
+                        hist_data = (0.0, 0.0)  # Use defaults
+
+                    oi_change_pct, volume_spike_score = hist_data
+                    tasks.append(
+                        self.options_fetcher.get_activity_summary(
+                            underlying,
+                            oi_change_pct=oi_change_pct,
+                            volume_spike_score=volume_spike_score,
+                        )
+                    )
+
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                self._api_calls_made += len(batch)
-                
+                self._api_calls_made += len(batch) * 3  # Options chain + OI history + Volume history
+
                 for result in results:
                     if isinstance(result, ActivityMetrics):
                         metrics_list.append(result)
                     elif isinstance(result, Exception):
                         logger.debug(f"Failed to get metrics: {result}")
-            
+
             # Score and rank
             for metrics in metrics_list:
                 self.activity_scorer.score_metrics(metrics)
-            
+
             # Select top assets
             selected = self.asset_selector.select(metrics_list)
-            
+
             logger.info(f"Selected {len(selected)} assets from {len(metrics_list)} candidates")
-            
+
             return selected
-            
+
         except Exception as e:
             logger.error(f"Activity scan failed: {e}")
             raise PipelineError(f"Activity scan failed: {e}")
+
+    async def _fetch_historical_data(self, symbol: str) -> tuple:
+        """
+        Fetch historical data for OI change and volume spike calculations.
+
+        Uses:
+        - /futures/data/openInterestHist (weight: 0) for OI change
+        - /fapi/v1/klines (weight: 2) for volume spike
+
+        Supports intraday mode (15m intervals) or daily mode based on config.
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+
+        Returns:
+            Tuple of (oi_change_pct, volume_spike_score)
+        """
+        try:
+            # Get intraday settings from config
+            intraday_config = getattr(self.config, 'intraday', None)
+            use_intraday = intraday_config and intraday_config.enabled
+            
+            # Determine periods based on mode
+            if use_intraday:
+                oi_period = intraday_config.oi_period
+                oi_limit = intraday_config.oi_limit
+                volume_interval = intraday_config.volume_interval
+                volume_limit = intraday_config.volume_limit
+                logger.debug(f"Using intraday mode for {symbol}: oi_period={oi_period}, vol_interval={volume_interval}")
+            else:
+                oi_period = "1d"
+                oi_limit = 7
+                volume_interval = "1d"
+                volume_limit = 30
+                logger.debug(f"Using daily mode for {symbol}")
+
+            # Fetch OI history
+            oi_stats = await self.futures_fetcher.get_oi_statistics(
+                symbol=symbol,
+                period=oi_period,
+                limit=oi_limit,
+            )
+
+            # Fetch volume history
+            volume_history = await self.futures_fetcher.get_volume_history(
+                symbol=symbol,
+                interval=volume_interval,
+                limit=volume_limit,
+            )
+
+            # Calculate OI change percentage
+            # For intraday: compares current vs 4h ago (16 candles of 15m)
+            # For daily: compares current vs 7 days ago
+            oi_change_pct = 0.0
+            if len(oi_stats) >= 2:
+                latest_oi = oi_stats[-1].get("sum_open_interest", 0)
+                
+                if use_intraday:
+                    # For intraday, compare with 4h ago (16 candles back)
+                    # or start of period if less data
+                    comparison_idx = max(0, min(16, len(oi_stats) - 1))
+                    comparison_oi = oi_stats[comparison_idx].get("sum_open_interest", 0)
+                else:
+                    # For daily, compare with start
+                    comparison_oi = oi_stats[0].get("sum_open_interest", 0)
+                
+                if comparison_oi > 0:
+                    oi_change_pct = (latest_oi - comparison_oi) / comparison_oi * 100
+
+            # Calculate volume spike score
+            # For intraday: compares current vs last 4h avg
+            # For daily: compares current vs 30-day avg
+            volume_spike_score = 0.0
+            if len(volume_history) >= 4:
+                volumes = [v.get("volume", 0) for v in volume_history]
+                current_volume = volumes[-1]
+                
+                if use_intraday:
+                    # For intraday, use last 16 candles (4h) for average
+                    avg_volume = sum(volumes[-17:-1]) / 16 if len(volumes) >= 17 else sum(volumes[:-1]) / max(1, len(volumes) - 1)
+                else:
+                    # For daily, use all but last for average
+                    avg_volume = sum(volumes[:-1]) / max(1, len(volumes) - 1)
+
+                if avg_volume > 0:
+                    spike_ratio = current_volume / avg_volume
+                    # Convert ratio to score: 1x = 0, 2x = 1.0, 3x+ = 2.0+
+                    volume_spike_score = max(0, spike_ratio - 1)
+
+            logger.debug(
+                f"Historical data for {symbol}: oi_change={oi_change_pct:.2f}%, "
+                f"volume_spike={volume_spike_score:.2f}x (mode={'intraday' if use_intraday else 'daily'})"
+            )
+
+            return (oi_change_pct, volume_spike_score)
+
+        except Exception as e:
+            logger.debug(f"Failed to fetch historical data for {symbol}: {e}")
+            return (0.0, 0.0)
     
     async def _select_specific_symbols(
         self,
@@ -379,8 +514,34 @@ class PipelineOrchestrator:
             # Run wall detection
             wall_analysis = self.wall_detector.detect(options_chain)
             
-            # Run Options analysis
-            options_signal = self.signal_scorer.analyze(options_chain)
+            # Run gamma exposure analysis for dealer hedging levels
+            gamma_analysis = self.gamma_calculator.calculate(options_chain)
+            
+            # Fetch sentiment data (L/S ratios + funding rate history)
+            # Weight: 0 (L/S ratios) + 5 (funding rate) = 5 total
+            sentiment_data = await self.futures_fetcher.get_sentiment_data(symbol)
+            self._api_calls_made += 5  # Approximate: 0 + 0 + 5
+            
+            # Run sentiment analysis
+            sentiment_analysis = self.sentiment_analyzer.analyze(
+                symbol=symbol,
+                top_trader_position_data=sentiment_data.get("top_trader_position", []),
+                top_trader_account_data=sentiment_data.get("top_trader_account", []),
+                funding_rate_data=sentiment_data.get("funding_rate_history", []),
+            )
+            
+            logger.debug(
+                f"Sentiment analysis for {symbol}: "
+                f"position_ratio={sentiment_analysis.top_trader_position_ratio:.2f}, "
+                f"account_ratio={sentiment_analysis.top_trader_account_ratio:.2f}, "
+                f"funding_rate={sentiment_analysis.current_funding_rate:.6f}, "
+                f"combined={sentiment_analysis.sentiment_score:.2f}, "
+                f"signal={sentiment_analysis.signal.value}, "
+                f"contrarian={sentiment_analysis.is_contrarian_signal}"
+            )
+            
+            # Run Options analysis with sentiment
+            options_signal = self.signal_scorer.analyze(options_chain, sentiment_analysis)
             
             # Debug: Log analysis results
             logger.debug(
@@ -402,6 +563,8 @@ class PipelineOrchestrator:
                     futures_data=futures_data,
                     whale_analysis=whale_analysis,
                     wall_analysis=wall_analysis,
+                    gamma_analysis=gamma_analysis,
+                    sentiment_analysis=sentiment_analysis,
                 )
             else:
                 logger.debug(f"Signal confidence {options_signal.confidence:.3f} below threshold {self.pipeline_config.min_signal_confidence}")
@@ -420,6 +583,8 @@ class PipelineOrchestrator:
         futures_data: FuturesData,
         whale_analysis: Optional[Any] = None,
         wall_analysis: Optional[Any] = None,
+        gamma_analysis: Optional[Any] = None,
+        sentiment_analysis: Optional[Any] = None,
     ) -> TradingSignal:
         """
         Create a complete trading signal.
@@ -429,6 +594,10 @@ class PipelineOrchestrator:
             options_signal: Options analysis signal
             options_chain: Options chain data
             futures_data: Futures data
+            whale_analysis: Whale activity analysis
+            wall_analysis: Wall detection analysis
+            gamma_analysis: Gamma exposure analysis for dealer hedging levels
+            sentiment_analysis: Sentiment analysis from L/S ratios and funding rates
             
         Returns:
             Complete TradingSignal
@@ -543,6 +712,51 @@ class PipelineOrchestrator:
             "wall_intensity": wall_analysis.wall_intensity if wall_analysis else 0.0,
             "wall_imbalance": wall_analysis.wall_imbalance if wall_analysis else 0.0,
         }
+        
+        # Add gamma exposure metrics
+        gamma_metrics = {}
+        if gamma_analysis:
+            gamma_metrics = {
+                "gex_regime": gamma_analysis.gex_regime,
+                "dealer_hedge_pressure": gamma_analysis.dealer_hedge_pressure,
+                "gamma_flip": gamma_analysis.gamma_flip,
+                "total_gex": gamma_analysis.total_gex,
+                "gamma_risk_score": gamma_analysis.gamma_risk_score,
+            }
+            
+            # Use gamma levels to enhance support/resistance if walls are missing
+            if not resistance_levels and gamma_analysis.gex_resistance_levels:
+                resistance_levels = [
+                    {"level": i + 1, "price": l.strike, "gex": round(l.gex_value, 2),
+                     "strength": round(l.strength, 2), "type": "GAMMA_RESISTANCE"}
+                    for i, l in enumerate(gamma_analysis.gex_resistance_levels[:3])
+                ]
+            if not support_levels and gamma_analysis.gex_support_levels:
+                support_levels = [
+                    {"level": i + 1, "price": l.strike, "gex": round(l.gex_value, 2),
+                     "strength": round(l.strength, 2), "type": "GAMMA_SUPPORT"}
+                    for i, l in enumerate(gamma_analysis.gex_support_levels[:3])
+                ]
+        
+        # Merge gamma metrics into options_metrics
+        options_metrics.update(gamma_metrics)
+        
+        # Add sentiment metrics (L/S ratios + funding rates)
+        sentiment_metrics = {}
+        if sentiment_analysis:
+            sentiment_metrics = {
+                "top_trader_position_ratio": round(sentiment_analysis.top_trader_position_ratio, 3),
+                "top_trader_account_ratio": round(sentiment_analysis.top_trader_account_ratio, 3),
+                "current_funding_rate": sentiment_analysis.current_funding_rate,
+                "funding_rate_avg_7d": sentiment_analysis.funding_rate_avg_7d,
+                "funding_rate_extreme": sentiment_analysis.funding_rate_extreme,
+                "sentiment_score": round(sentiment_analysis.sentiment_score, 3),
+                "combined_sentiment": sentiment_analysis.combined_sentiment,
+                "is_contrarian_signal": sentiment_analysis.is_contrarian_signal,
+            }
+        
+        # Merge sentiment metrics into options_metrics
+        options_metrics.update(sentiment_metrics)
         
         futures_metrics = {
             "price": futures_data.price,

@@ -21,6 +21,7 @@ from binance_signal_generator.models import (
     PCRAnalysis,
     OIAnalysis,
     MaxPainAnalysis,
+    SentimentAnalysis,
     SignalDirection,
 )
 from binance_signal_generator.analysis.iv_analyzer import IVAnalyzer, IVConfig
@@ -35,11 +36,12 @@ logger = get_logger(__name__)
 @dataclass
 class SignalScorerConfig:
     """Configuration for signal scoring."""
-    # Weights for each signal type
-    iv_weight: float = 0.25
-    pcr_weight: float = 0.30
-    oi_weight: float = 0.25
-    max_pain_weight: float = 0.20
+    # Weights for each signal type (total must equal 1.0)
+    iv_weight: float = 0.20
+    pcr_weight: float = 0.25
+    oi_weight: float = 0.20
+    max_pain_weight: float = 0.15
+    sentiment_weight: float = 0.20  # New: Sentiment from L/S ratios + funding
     
     # Minimum confidence for valid signal
     min_confidence: float = 0.4
@@ -100,16 +102,22 @@ class SignalScorer:
                     "pcr": self.config.pcr_weight,
                     "oi": self.config.oi_weight,
                     "max_pain": self.config.max_pain_weight,
+                    "sentiment": self.config.sentiment_weight,
                 },
             }}
         )
     
-    def analyze(self, chain: OptionsChain) -> OptionsSignal:
+    def analyze(
+        self,
+        chain: OptionsChain,
+        sentiment_analysis: Optional[SentimentAnalysis] = None,
+    ) -> OptionsSignal:
         """
         Perform complete analysis and generate combined signal.
         
         Args:
             chain: Options chain data
+            sentiment_analysis: Optional sentiment analysis from L/S ratios
             
         Returns:
             OptionsSignal with combined analysis
@@ -121,12 +129,16 @@ class SignalScorer:
         max_pain_analysis = self.max_pain_calculator.calculate(chain)
         
         # Debug logging
+        sentiment_str = ""
+        if sentiment_analysis:
+            sentiment_str = f", Sentiment={sentiment_analysis.signal.value}({sentiment_analysis.signal_confidence:.2f})"
         logger.debug(
             f"Signal components for {chain.underlying}: "
             f"IV={iv_analysis.signal.value}({iv_analysis.confidence:.2f}), "
             f"PCR={pcr_analysis.signal.value}({pcr_analysis.confidence:.2f}), "
             f"OI={oi_analysis.signal.value}({oi_analysis.confidence:.2f}), "
             f"MaxPain={max_pain_analysis.signal.value}({max_pain_analysis.confidence:.2f})"
+            f"{sentiment_str}"
         )
         
         # Combine signals
@@ -135,6 +147,7 @@ class SignalScorer:
             pcr_analysis=pcr_analysis,
             oi_analysis=oi_analysis,
             max_pain_analysis=max_pain_analysis,
+            sentiment_analysis=sentiment_analysis,
         )
         
         return OptionsSignal(
@@ -155,6 +168,7 @@ class SignalScorer:
         pcr_analysis: PCRAnalysis,
         oi_analysis: OIAnalysis,
         max_pain_analysis: MaxPainAnalysis,
+        sentiment_analysis: Optional[SentimentAnalysis] = None,
     ) -> tuple:
         """
         Combine multiple signals into one.
@@ -164,6 +178,7 @@ class SignalScorer:
             pcr_analysis: PCR analysis result
             oi_analysis: OI analysis result
             max_pain_analysis: Max Pain analysis result
+            sentiment_analysis: Optional sentiment analysis from L/S ratios
             
         Returns:
             Tuple of (SignalDirection, confidence, raw_score)
@@ -176,24 +191,38 @@ class SignalScorer:
             "max_pain": self._signal_to_numeric(max_pain_analysis.signal) * max_pain_analysis.confidence,
         }
         
+        # Add sentiment signal if available
+        if sentiment_analysis:
+            sentiment_numeric = self._signal_to_numeric(sentiment_analysis.signal)
+            # If contrarian, flip the signal direction for scoring
+            if sentiment_analysis.is_contrarian_signal:
+                sentiment_numeric = -sentiment_numeric
+            signals["sentiment"] = sentiment_numeric * sentiment_analysis.signal_confidence
+        else:
+            signals["sentiment"] = 0.0
+        
         # Apply weights
         weighted_signals = {
             "iv": signals["iv"] * self.config.iv_weight,
             "pcr": signals["pcr"] * self.config.pcr_weight,
             "oi": signals["oi"] * self.config.oi_weight,
             "max_pain": signals["max_pain"] * self.config.max_pain_weight,
+            "sentiment": signals["sentiment"] * self.config.sentiment_weight,
         }
         
         # Calculate raw score
         raw_score = sum(weighted_signals.values())
         
-        # Calculate agreement
-        agreement = self._calculate_agreement(
+        # Calculate agreement (include sentiment if available)
+        signal_list = [
             iv_analysis.signal,
             pcr_analysis.signal,
             oi_analysis.signal,
             max_pain_analysis.signal,
-        )
+        ]
+        if sentiment_analysis:
+            signal_list.append(sentiment_analysis.signal)
+        agreement = self._calculate_agreement(*signal_list)
         
         # Determine direction
         if raw_score > 0.15:

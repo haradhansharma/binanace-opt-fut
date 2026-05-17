@@ -1,0 +1,506 @@
+"""
+Sentiment analysis module for market positioning signals.
+
+This module analyzes market sentiment from multiple sources:
+1. Top Trader Long/Short Ratio (Positions) - Top 20% traders by margin
+2. Top Trader Long/Short Ratio (Accounts) - Account-level positioning
+3. Funding Rate - Cost of holding positions
+
+The sentiment analyzer can be used as:
+- A standalone sentiment indicator
+- Part of the signal scoring system
+- A contrarian indicator when sentiment reaches extremes
+
+Rate Limits:
+- Top Trader L/S Ratios: FREE (weight 0)
+- Funding Rate History: weight 5 per call
+
+APIs Used:
+- GET /futures/data/topLongShortPositionRatio
+- GET /futures/data/topLongShortAccountRatio
+- GET /fapi/v1/fundingRate
+"""
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+
+from binance_signal_generator.models import (
+    SentimentAnalysis,
+    LSRatioData,
+    FundingRateData,
+    SignalDirection,
+)
+from binance_signal_generator.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class SentimentConfig:
+    """Configuration for sentiment analysis."""
+    # L/S Ratio thresholds
+    ls_ratio_extreme_high: float = 2.0  # > 2.0 = extreme bullish (contrarian short)
+    ls_ratio_extreme_low: float = 0.5   # < 0.5 = extreme bearish (contrarian long)
+    ls_ratio_bullish: float = 1.2       # > 1.2 = bullish
+    ls_ratio_bearish: float = 0.8       # < 0.8 = bearish
+    
+    # Funding rate thresholds (in decimal, e.g., 0.0001 = 0.01%)
+    funding_extreme_high: float = 0.0005   # > 0.05% = extremely long
+    funding_extreme_low: float = -0.0005   # < -0.05% = extremely short
+    funding_bullish: float = 0.0001        # > 0.01% = long bias
+    funding_bearish: float = -0.0001       # < -0.01% = short bias
+    
+    # Lookback periods
+    ls_ratio_lookback_periods: int = 5     # Periods to analyze trend
+    funding_rate_lookback_hours: int = 168  # 7 days for average
+    
+    # Weights for combined sentiment
+    top_trader_position_weight: float = 0.35
+    top_trader_account_weight: float = 0.25
+    funding_rate_weight: float = 0.40
+    
+    # Contrarian mode
+    use_contrarian_signals: bool = True
+    contrarian_extreme_threshold: float = 3.0  # L/S ratio > 3.0 = strong contrarian
+
+
+class SentimentAnalyzer:
+    """
+    Analyzes market sentiment from L/S ratios and funding rates.
+    
+    Sentiment Sources:
+    1. Top Trader Position Ratio: What the largest traders are doing
+       - Ratio > 1: Longs dominate (bullish sentiment)
+       - Ratio < 1: Shorts dominate (bearish sentiment)
+    
+    2. Top Trader Account Ratio: How many accounts are long vs short
+       - More accounts long = retail bullish
+       - Fewer accounts long = smart money positioning
+    
+    3. Funding Rate: Cost to hold positions
+       - Positive funding: Longs pay shorts (overcrowded longs)
+       - Negative funding: Shorts pay longs (overcrowded shorts)
+    
+    Signal Generation:
+    - Following mode: Trade with smart money (top traders)
+    - Contrarian mode: Fade extreme positioning (crowd is wrong)
+    
+    Attributes:
+        config: Sentiment analysis configuration
+    """
+    
+    def __init__(self, config: Optional[SentimentConfig] = None):
+        """
+        Initialize sentiment analyzer.
+        
+        Args:
+            config: Optional custom configuration
+        """
+        self.config = config or SentimentConfig()
+        
+        logger.info(
+            "Sentiment analyzer initialized",
+            extra={"data": {
+                "ls_extreme_high": self.config.ls_ratio_extreme_high,
+                "ls_extreme_low": self.config.ls_ratio_extreme_low,
+                "use_contrarian": self.config.use_contrarian_signals,
+            }}
+        )
+    
+    def analyze(
+        self,
+        symbol: str,
+        top_trader_position_data: List[LSRatioData],
+        top_trader_account_data: List[LSRatioData],
+        funding_rate_data: List[FundingRateData],
+    ) -> SentimentAnalysis:
+        """
+        Perform complete sentiment analysis.
+        
+        Args:
+            symbol: Trading pair symbol
+            top_trader_position_data: Top trader position ratio history
+            top_trader_account_data: Top trader account ratio history
+            funding_rate_data: Funding rate history
+            
+        Returns:
+            SentimentAnalysis with combined sentiment
+        """
+        timestamp = datetime.utcnow()
+        
+        # Analyze each component
+        position_analysis = self._analyze_ls_ratio(
+            top_trader_position_data,
+            "position",
+        )
+        account_analysis = self._analyze_ls_ratio(
+            top_trader_account_data,
+            "account",
+        )
+        funding_analysis = self._analyze_funding_rate(funding_rate_data)
+        
+        # Extract values
+        position_ratio = position_analysis["ratio"]
+        position_trend = position_analysis["trend"]
+        position_score = position_analysis["score"]
+        
+        account_ratio = account_analysis["ratio"]
+        account_trend = account_analysis["trend"]
+        account_score = account_analysis["score"]
+        
+        funding_rate = funding_analysis["current_rate"]
+        funding_avg = funding_analysis["avg_rate"]
+        funding_extreme = funding_analysis["is_extreme"]
+        funding_score = funding_analysis["score"]
+        
+        # Calculate combined sentiment score
+        combined_score = (
+            position_score * self.config.top_trader_position_weight +
+            account_score * self.config.top_trader_account_weight +
+            funding_score * self.config.funding_rate_weight
+        )
+        
+        # Determine combined sentiment
+        if combined_score > 0.15:
+            combined_sentiment = "BULLISH"
+        elif combined_score < -0.15:
+            combined_sentiment = "BEARISH"
+        else:
+            combined_sentiment = "NEUTRAL"
+        
+        # Determine signal
+        signal, signal_confidence, is_contrarian = self._determine_signal(
+            position_score=position_score,
+            account_score=account_score,
+            funding_score=funding_score,
+            combined_score=combined_score,
+            position_ratio=position_ratio,
+            account_ratio=account_ratio,
+            funding_extreme=funding_extreme,
+        )
+        
+        # Calculate overall confidence
+        confidence = self._calculate_confidence(
+            position_data=top_trader_position_data,
+            account_data=top_trader_account_data,
+            funding_data=funding_rate_data,
+        )
+        
+        logger.debug(
+            f"Sentiment analysis for {symbol}: "
+            f"position_ratio={position_ratio:.2f}, account_ratio={account_ratio:.2f}, "
+            f"funding={funding_rate:.6f}, combined={combined_score:.2f}, "
+            f"signal={signal.value}, contrarian={is_contrarian}"
+        )
+        
+        return SentimentAnalysis(
+            symbol=symbol,
+            timestamp=timestamp,
+            top_trader_position_ratio=position_ratio,
+            top_trader_position_trend=position_trend,
+            top_trader_position_score=position_score,
+            top_trader_account_ratio=account_ratio,
+            top_trader_account_trend=account_trend,
+            top_trader_account_score=account_score,
+            current_funding_rate=funding_rate,
+            funding_rate_avg_7d=funding_avg,
+            funding_rate_extreme=funding_extreme,
+            funding_rate_score=funding_score,
+            combined_sentiment=combined_sentiment,
+            sentiment_score=combined_score,
+            confidence=confidence,
+            signal=signal,
+            signal_confidence=signal_confidence,
+            is_contrarian_signal=is_contrarian,
+        )
+    
+    def _analyze_ls_ratio(
+        self,
+        data: List[LSRatioData],
+        data_type: str,
+    ) -> Dict[str, Any]:
+        """
+        Analyze L/S ratio data for trend and score.
+        
+        Args:
+            data: List of L/S ratio data points
+            data_type: "position" or "account"
+            
+        Returns:
+            Dictionary with ratio, trend, and score
+        """
+        if not data:
+            return {
+                "ratio": 1.0,
+                "trend": "NEUTRAL",
+                "score": 0.0,
+            }
+        
+        # Get latest ratio
+        latest = data[-1]
+        ratio = latest.long_short_ratio
+        
+        # Determine trend from recent history
+        lookback = min(self.config.ls_ratio_lookback_periods, len(data))
+        if lookback >= 2:
+            recent = data[-lookback:]
+            older = data[:-lookback] if len(data) > lookback else recent
+            
+            recent_avg = sum(d.long_short_ratio for d in recent) / len(recent)
+            older_avg = sum(d.long_short_ratio for d in older) / len(older) if older else recent_avg
+            
+            if recent_avg > older_avg * 1.1:
+                trend = "BULLISH"  # Becoming more long
+            elif recent_avg < older_avg * 0.9:
+                trend = "BEARISH"  # Becoming more short
+            else:
+                trend = "NEUTRAL"
+        else:
+            trend = "NEUTRAL"
+        
+        # Calculate score (-1 to 1)
+        # Score interpretation:
+        # - Positive = bullish sentiment (more longs)
+        # - Negative = bearish sentiment (more shorts)
+        # - Extreme values trigger contrarian consideration
+        
+        if ratio > self.config.ls_ratio_extreme_high:
+            # Extreme bullish positioning
+            # In following mode: bullish signal
+            # In contrarian mode: potential reversal signal
+            score = 1.0
+        elif ratio > self.config.ls_ratio_bullish:
+            score = min((ratio - 1.0) / (self.config.ls_ratio_extreme_high - 1.0), 1.0)
+        elif ratio < self.config.ls_ratio_extreme_low:
+            # Extreme bearish positioning
+            score = -1.0
+        elif ratio < self.config.ls_ratio_bearish:
+            score = max((ratio - 1.0) / (1.0 - self.config.ls_ratio_extreme_low), -1.0)
+        else:
+            # Neutral zone
+            score = 0.0
+        
+        return {
+            "ratio": ratio,
+            "trend": trend,
+            "score": round(score, 3),
+        }
+    
+    def _analyze_funding_rate(
+        self,
+        data: List[FundingRateData],
+    ) -> Dict[str, Any]:
+        """
+        Analyze funding rate for sentiment.
+        
+        Interpretation:
+        - Positive funding: Longs pay shorts = overcrowded longs
+        - Negative funding: Shorts pay longs = overcrowded shorts
+        - Extreme funding: Potential reversal indicator
+        
+        Args:
+            data: List of funding rate data points
+            
+        Returns:
+            Dictionary with current rate, avg, extreme flag, and score
+        """
+        if not data:
+            return {
+                "current_rate": 0.0,
+                "avg_rate": 0.0,
+                "is_extreme": False,
+                "score": 0.0,
+            }
+        
+        # Get latest funding rate
+        latest = data[-1]
+        current_rate = latest.funding_rate
+        
+        # Calculate 7-day average
+        cutoff = datetime.utcnow() - timedelta(hours=self.config.funding_rate_lookback_hours)
+        recent_data = [d for d in data if d.timestamp >= cutoff]
+        avg_rate = sum(d.funding_rate for d in recent_data) / len(recent_data) if recent_data else 0.0
+        
+        # Determine if extreme
+        is_extreme = (
+            current_rate > self.config.funding_extreme_high or
+            current_rate < self.config.funding_extreme_low
+        )
+        
+        # Calculate score
+        # Note: High positive funding = bearish contrarian signal
+        #       High negative funding = bullish contrarian signal
+        # We return the raw sentiment (not contrarian-adjusted)
+        
+        if current_rate > self.config.funding_extreme_high:
+            # Extremely positive funding = crowded longs = potential short
+            score = 0.8  # Bullish sentiment, but contrarian
+        elif current_rate > self.config.funding_bullish:
+            score = 0.5
+        elif current_rate < self.config.funding_extreme_low:
+            # Extremely negative funding = crowded shorts = potential long
+            score = -0.8
+        elif current_rate < self.config.funding_bearish:
+            score = -0.5
+        else:
+            score = 0.0
+        
+        return {
+            "current_rate": current_rate,
+            "avg_rate": avg_rate,
+            "is_extreme": is_extreme,
+            "score": round(score, 3),
+        }
+    
+    def _determine_signal(
+        self,
+        position_score: float,
+        account_score: float,
+        funding_score: float,
+        combined_score: float,
+        position_ratio: float,
+        account_ratio: float,
+        funding_extreme: bool,
+    ) -> tuple:
+        """
+        Determine the trading signal from sentiment.
+        
+        Signal Logic:
+        1. Following mode: Trade with top trader positioning
+        2. Contrarian mode: Fade extreme positioning
+        3. Funding extremes: Contrarian signal
+        
+        Args:
+            All sentiment component scores
+            
+        Returns:
+            Tuple of (SignalDirection, confidence, is_contrarian)
+        """
+        is_contrarian = False
+        
+        # Check for extreme positioning (contrarian signal)
+        if self.config.use_contrarian_signals:
+            # Extreme long positioning -> contrarian short
+            if position_ratio > self.config.contrarian_extreme_threshold:
+                signal = SignalDirection.SHORT
+                is_contrarian = True
+                confidence = min((position_ratio - 1.0) / self.config.contrarian_extreme_threshold, 0.8)
+                return signal, confidence, is_contrarian
+            
+            # Extreme short positioning -> contrarian long
+            if position_ratio < 1.0 / self.config.contrarian_extreme_threshold:
+                signal = SignalDirection.LONG
+                is_contrarian = True
+                confidence = min((1.0 / position_ratio - 1.0) / self.config.contrarian_extreme_threshold, 0.8)
+                return signal, confidence, is_contrarian
+            
+            # Funding extreme -> contrarian
+            if funding_extreme:
+                # High positive funding = crowded longs = fade with short
+                if funding_score > 0:
+                    signal = SignalDirection.SHORT
+                    is_contrarian = True
+                    confidence = 0.6
+                    return signal, confidence, is_contrarian
+                else:
+                    signal = SignalDirection.LONG
+                    is_contrarian = True
+                    confidence = 0.6
+                    return signal, confidence, is_contrarian
+        
+        # Normal following mode
+        if combined_score > 0.15:
+            signal = SignalDirection.LONG
+            confidence = min(abs(combined_score), 0.8)
+        elif combined_score < -0.15:
+            signal = SignalDirection.SHORT
+            confidence = min(abs(combined_score), 0.8)
+        else:
+            signal = SignalDirection.NEUTRAL
+            confidence = 0.0
+        
+        return signal, round(confidence, 3), is_contrarian
+    
+    def _calculate_confidence(
+        self,
+        position_data: List[LSRatioData],
+        account_data: List[LSRatioData],
+        funding_data: List[FundingRateData],
+    ) -> float:
+        """
+        Calculate confidence based on data availability and consistency.
+        
+        Args:
+            All sentiment data
+            
+        Returns:
+            Confidence score (0-1)
+        """
+        confidence = 0.0
+        
+        # Data availability factor
+        has_position = len(position_data) > 0
+        has_account = len(account_data) > 0
+        has_funding = len(funding_data) > 0
+        
+        if has_position:
+            confidence += 0.35
+        if has_account:
+            confidence += 0.25
+        if has_funding:
+            confidence += 0.40
+        
+        # Historical depth factor
+        if has_position and len(position_data) >= 5:
+            confidence += 0.1
+        if has_account and len(account_data) >= 5:
+            confidence += 0.1
+        if has_funding and len(funding_data) >= 10:
+            confidence += 0.1
+        
+        return min(confidence, 1.0)
+    
+    def get_sentiment_breakdown(self, analysis: SentimentAnalysis) -> Dict[str, Any]:
+        """
+        Get detailed breakdown of sentiment components.
+        
+        Args:
+            analysis: Sentiment analysis result
+            
+        Returns:
+            Dictionary with detailed breakdown
+        """
+        return {
+            "symbol": analysis.symbol,
+            "timestamp": analysis.timestamp.isoformat(),
+            "combined": {
+                "sentiment": analysis.combined_sentiment,
+                "score": round(analysis.sentiment_score, 3),
+                "confidence": round(analysis.confidence, 3),
+            },
+            "top_trader_position": {
+                "ratio": round(analysis.top_trader_position_ratio, 3),
+                "trend": analysis.top_trader_position_trend,
+                "score": round(analysis.top_trader_position_score, 3),
+                "weight": self.config.top_trader_position_weight,
+            },
+            "top_trader_account": {
+                "ratio": round(analysis.top_trader_account_ratio, 3),
+                "trend": analysis.top_trader_account_trend,
+                "score": round(analysis.top_trader_account_score, 3),
+                "weight": self.config.top_trader_account_weight,
+            },
+            "funding_rate": {
+                "current": analysis.current_funding_rate,
+                "avg_7d": analysis.funding_rate_avg_7d,
+                "extreme": analysis.funding_rate_extreme,
+                "score": round(analysis.funding_rate_score, 3),
+                "weight": self.config.funding_rate_weight,
+            },
+            "signal": {
+                "direction": analysis.signal.value,
+                "confidence": round(analysis.signal_confidence, 3),
+                "is_contrarian": analysis.is_contrarian_signal,
+            },
+        }

@@ -150,17 +150,17 @@ Examples:
     parser.add_argument(
         "--min-confidence",
         type=float,
-        default=0.50,
+        default=0.30,
         metavar="SCORE",
-        help="Minimum signal confidence to output (default: 0.50)",
+        help="Minimum signal confidence to output (default: 0.30)",
     )
     
     parser.add_argument(
         "--min-activity",
         type=float,
-        default=0.30,
+        default=0.15,
         metavar="SCORE",
-        help="Minimum activity score for asset selection (default: 0.30)",
+        help="Minimum activity score for asset selection (default: 0.15)",
     )
     
     return parser
