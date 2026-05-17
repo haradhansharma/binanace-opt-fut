@@ -502,9 +502,11 @@ class EntryZone:
 class StopLoss:
     """Stop loss configuration."""
     price: float
-    type: str  # 'WALL_BASED', 'PERCENTAGE', 'FIXED'
+    type: str  # 'WALL_BASED', 'PERCENTAGE', 'FIXED', 'PCR_SUPPORT', 'PCR_RESISTANCE', 'GAMMA_SUPPORT', 'GAMMA_RESISTANCE'
     wall: Optional[Dict] = None
     distance_pct: float = 0.0
+    source_strike: Optional[float] = None  # Which strike provided this SL
+    confidence: float = 0.0  # How strong is this level (0-1)
 
 
 @dataclass
@@ -514,7 +516,8 @@ class TakeProfitLevel:
     price: float
     ratio: float
     distance_pct: float
-    wall_type: Optional[str] = None
+    type: Optional[str] = None  # 'CALL_WALL', 'PUT_WALL', 'GAMMA_RESISTANCE', 'GAMMA_SUPPORT', 'PCR_RESISTANCE', 'PCR_SUPPORT', 'PERCENTAGE'
+    source: Optional[str] = None  # Source identifier for debugging
 
 
 @dataclass
@@ -574,8 +577,9 @@ class TradingSignal:
             "stop_loss": {
                 "price": self.stop_loss.price,
                 "type": self.stop_loss.type,
-                "wall": self.stop_loss.wall,
                 "distance_pct": self.stop_loss.distance_pct,
+                "source_strike": self.stop_loss.source_strike,
+                "confidence": round(self.stop_loss.confidence, 2),
             },
             "take_profit_levels": [
                 {
@@ -583,7 +587,8 @@ class TradingSignal:
                     "price": tp.price,
                     "ratio": tp.ratio,
                     "distance_pct": tp.distance_pct,
-                    "wall_type": tp.wall_type,
+                    "type": tp.type,
+                    "source": tp.source,
                 }
                 for tp in self.take_profit_levels
             ],

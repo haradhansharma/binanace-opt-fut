@@ -219,6 +219,8 @@ class JSONOutput:
                 "price": round(signal.stop_loss.price, 4),
                 "type": signal.stop_loss.type,
                 "distance_pct": round(signal.stop_loss.distance_pct, 2),
+                "source_strike": signal.stop_loss.source_strike,
+                "confidence": round(signal.stop_loss.confidence, 2),
             },
             
             # Take profit levels
@@ -228,6 +230,8 @@ class JSONOutput:
                     "price": round(tp.price, 4),
                     "ratio": round(tp.ratio, 2),
                     "distance_pct": round(tp.distance_pct, 2),
+                    "type": tp.type,
+                    "source": tp.source,
                 }
                 for tp in signal.take_profit_levels
             ],
