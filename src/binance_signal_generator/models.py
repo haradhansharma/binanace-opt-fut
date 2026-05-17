@@ -22,6 +22,7 @@ class SignalDirection(Enum):
     NEUTRAL = "NEUTRAL"
 
 
+## finalizing before clean
 class SignalStrength(Enum):
     """Signal strength classification."""
     WEAK = "WEAK"
