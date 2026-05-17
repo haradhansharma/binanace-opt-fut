@@ -391,6 +391,11 @@ class GammaAnalysis:
     
     # Risk metrics
     gamma_risk_score: float = 0.0  # 0-1, higher = more volatile expected
+    
+    # DTE (Days to Expiry) metrics
+    dte_days: float = 7.0  # Days to expiry (default 7 days)
+    dte_weight: float = 1.0  # DTE weight factor (higher = near expiry = stronger gamma effect)
+    expiry_imminent: bool = False  # True if DTE <= 3 days
 
 
 # =============================================================================
@@ -492,6 +497,7 @@ class OptionsSignal:
     oi_analysis: Optional[OIAnalysis] = None
     max_pain_analysis: Optional[MaxPainAnalysis] = None
     whale_analysis: Optional[WhaleAnalysis] = None
+    gamma_analysis: Optional[GammaAnalysis] = None
 
 
 # =============================================================================

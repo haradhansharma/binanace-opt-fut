@@ -540,8 +540,12 @@ class PipelineOrchestrator:
                 f"contrarian={sentiment_analysis.is_contrarian_signal}"
             )
             
-            # Run Options analysis with sentiment
-            options_signal = self.signal_scorer.analyze(options_chain, sentiment_analysis)
+            # Run Options analysis with sentiment and gamma exposure
+            options_signal = self.signal_scorer.analyze(
+                options_chain, 
+                sentiment_analysis,
+                gamma_analysis,
+            )
             
             # Debug: Log analysis results
             logger.debug(
@@ -722,6 +726,10 @@ class PipelineOrchestrator:
                 "gamma_flip": gamma_analysis.gamma_flip,
                 "total_gex": gamma_analysis.total_gex,
                 "gamma_risk_score": gamma_analysis.gamma_risk_score,
+                # DTE (Days to Expiry) metrics
+                "dte_days": round(gamma_analysis.dte_days, 1),
+                "dte_weight": round(gamma_analysis.dte_weight, 2),
+                "expiry_imminent": gamma_analysis.expiry_imminent,
             }
             
             # Use gamma levels to enhance support/resistance if walls are missing

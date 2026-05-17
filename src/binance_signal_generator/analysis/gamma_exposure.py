@@ -19,7 +19,7 @@ Reference:
 - https://squeezemetrics.com/monitor/download/pdf/white_paper.pdf
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 import math
@@ -49,6 +49,20 @@ class GammaExposureConfig:
     
     # Whether to use simplified delta approximation
     use_simplified_delta: bool = True
+    
+    # DTE weighting parameters
+    # Gamma effect is strongest near expiry: Gamma ∝ 1/√T
+    # Reference DTE for normalization (7 days = baseline weight of 1.0)
+    dte_reference_days: float = 7.0
+    
+    # Maximum DTE weight (for very short-dated options, e.g., DTE=1)
+    max_dte_weight: float = 3.0
+    
+    # Minimum DTE weight (for long-dated options, e.g., DTE>30)
+    min_dte_weight: float = 0.3
+    
+    # Enable DTE weighting
+    enable_dte_weighting: bool = True
 
 
 class GammaExposureCalculator:
@@ -109,13 +123,17 @@ class GammaExposureCalculator:
         """
         spot = chain.spot_price
         
+        # Calculate DTE (Days to Expiry)
+        dte = self._calculate_dte(chain.expiry)
+        dte_weight = self._calculate_dte_weight(dte)
+        
         logger.info(
             f"Calculating gamma exposure for {chain.underlying}: "
-            f"strikes={len(chain.strikes)}, spot={spot}"
+            f"strikes={len(chain.strikes)}, spot={spot}, DTE={dte:.1f} days, DTE_weight={dte_weight:.2f}"
         )
         
-        # Calculate GEX at each strike
-        strike_gex = self._calculate_strike_gex(chain, spot)
+        # Calculate GEX at each strike with DTE weighting
+        strike_gex = self._calculate_strike_gex(chain, spot, dte_weight)
         
         # Calculate aggregate metrics
         total_call_gex = sum(g['call_gex'] for g in strike_gex.values())
@@ -146,8 +164,8 @@ class GammaExposureCalculator:
         gex_regime = self._determine_gex_regime(net_gex, abs_gex_surface)
         hedge_pressure = self._determine_hedge_pressure(net_gex, gex_regime)
         
-        # Calculate risk score
-        risk_score = self._calculate_risk_score(abs_gex_surface, spot, len(chain.strikes))
+        # Calculate risk score with DTE adjustment
+        risk_score = self._calculate_risk_score(abs_gex_surface, spot, len(chain.strikes), dte_weight)
         
         # Normalize GEX per spot unit
         gex_per_spot = net_gex / spot if spot > 0 else 0
@@ -155,7 +173,7 @@ class GammaExposureCalculator:
         analysis = GammaAnalysis(
             symbol=chain.underlying,
             spot_price=spot,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             
             total_gex=net_gex,
             total_call_gex=total_call_gex,
@@ -172,8 +190,14 @@ class GammaExposureCalculator:
             dealer_hedge_pressure=hedge_pressure,
             
             gamma_risk_score=risk_score,
+            
+            # DTE metrics
+            dte_days=dte,
+            dte_weight=dte_weight,
+            expiry_imminent=(dte <= 3.0),
         )
         
+        # Add DTE info to analysis via extra logging
         logger.info(
             f"Gamma analysis complete for {chain.underlying}",
             extra={"data": {
@@ -181,27 +205,106 @@ class GammaExposureCalculator:
                 "gex_regime": gex_regime,
                 "support_levels": len(support_levels),
                 "resistance_levels": len(resistance_levels),
+                "dte_days": dte,
+                "dte_weight": dte_weight,
             }}
         )
         
         return analysis
     
+    def _calculate_dte(self, expiry: Optional[datetime]) -> float:
+        """
+        Calculate Days to Expiry (DTE) from expiry datetime.
+        
+        Args:
+            expiry: Option expiry datetime (UTC expected)
+            
+        Returns:
+            DTE in days (minimum 0.1 to avoid division by zero)
+        """
+        if expiry is None:
+            # If no expiry provided, assume standard 7-day expiry
+            return 7.0
+        
+        now = datetime.now(timezone.utc)
+        
+        # Handle both timezone-aware and naive datetimes
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        
+        delta = expiry - now
+        dte = delta.total_seconds() / 86400  # Convert to days
+        
+        # Ensure minimum DTE of 0.1 days (~2.4 hours) to avoid extreme weights
+        return max(dte, 0.1)
+    
+    def _calculate_dte_weight(self, dte: float) -> float:
+        """
+        Calculate DTE weight factor for gamma exposure.
+        
+        Theory:
+            Gamma ∝ 1/√T where T is time to expiry
+            As expiry approaches, gamma increases for ATM options
+            This means dealer hedging pressure intensifies near expiry
+        
+        Formula:
+            weight = √(reference_DTE / actual_DTE)
+            
+        Normalization:
+            - DTE = 7 days → weight = 1.0 (baseline)
+            - DTE = 1 day → weight = √7 ≈ 2.65 (higher impact)
+            - DTE = 30 days → weight = √(7/30) ≈ 0.48 (lower impact)
+        
+        Args:
+            dte: Days to expiry
+            
+        Returns:
+            DTE weight factor (clamped to configured min/max)
+        """
+        if not self.config.enable_dte_weighting:
+            return 1.0
+        
+        # Calculate raw weight using inverse square root of time
+        # This follows Black-Scholes gamma behavior
+        reference_dte = self.config.dte_reference_days
+        
+        if dte <= 0:
+            # Expired or about to expire - use max weight
+            return self.config.max_dte_weight
+        
+        # Gamma scales as 1/√T, so weight = √(reference/DTE)
+        raw_weight = math.sqrt(reference_dte / dte)
+        
+        # Clamp to configured bounds
+        weight = max(
+            self.config.min_dte_weight,
+            min(self.config.max_dte_weight, raw_weight)
+        )
+        
+        return weight
+    
     def _calculate_strike_gex(
         self,
         chain: OptionsChain,
         spot: float,
+        dte_weight: float = 1.0,
     ) -> Dict[float, Dict[str, float]]:
         """
-        Calculate GEX at each strike.
+        Calculate GEX at each strike with DTE weighting.
         
-        GEX = OI × Gamma × 100 × Spot² × 0.01
+        GEX = OI × Gamma × 100 × Spot² × 0.01 × DTE_weight
         
         For calls: Negative (dealers short calls = sell pressure above)
         For puts: Positive (dealers short puts = buy support below)
         
+        DTE Weighting:
+            Near expiry (low DTE): Higher gamma → stronger hedging pressure
+            Far expiry (high DTE): Lower gamma → weaker hedging pressure
+        
         Args:
             chain: Options chain
             spot: Current spot price
+            dte_weight: DTE weighting factor (default 1.0)
             
         Returns:
             Dictionary of strike -> GEX components
@@ -218,8 +321,9 @@ class GammaExposureCalculator:
             
             # Calculate gamma for calls and puts
             # Simplified: Gamma ≈ 1 / (spot × sqrt(2π)) for ATM, scaled for moneyness
-            call_gamma = self._estimate_gamma(spot, strike_price, "CALL")
-            put_gamma = self._estimate_gamma(spot, strike_price, "PUT")
+            # Apply DTE weighting to gamma
+            call_gamma = self._estimate_gamma(spot, strike_price, "CALL") * dte_weight
+            put_gamma = self._estimate_gamma(spot, strike_price, "PUT") * dte_weight
             
             # GEX formula: OI × Gamma × 100 × Spot² × 0.01
             # The 100 is contract multiplier, 0.01 is for 1% move
@@ -242,6 +346,7 @@ class GammaExposureCalculator:
                 'put_oi': put_oi,
                 'call_gamma': call_gamma,
                 'put_gamma': put_gamma,
+                'dte_weight': dte_weight,
             }
         
         return strike_gex
@@ -475,16 +580,19 @@ class GammaExposureCalculator:
         abs_gex_surface: float,
         spot: float,
         num_strikes: int,
+        dte_weight: float = 1.0,
     ) -> float:
         """
-        Calculate gamma risk score.
+        Calculate gamma risk score with DTE adjustment.
         
         Higher absolute GEX = higher volatility potential.
+        Near expiry (high DTE weight) = higher volatility risk.
         
         Args:
             abs_gex_surface: Total absolute GEX
             spot: Current spot price
             num_strikes: Number of strikes
+            dte_weight: DTE weighting factor (higher = near expiry = more risk)
             
         Returns:
             Risk score 0-1
@@ -497,19 +605,27 @@ class GammaExposureCalculator:
         
         # Scale to 0-1 (higher = more volatile)
         # Typical values are small, so we scale appropriately
-        risk_score = min(normalized_surface * 1000, 1.0)
+        base_risk_score = min(normalized_surface * 1000, 1.0)
+        
+        # Apply DTE adjustment: Near expiry = higher risk
+        # DTE weight > 1 means near expiry, amplify risk
+        # DTE weight < 1 means far expiry, reduce risk
+        dte_adjusted_risk = base_risk_score * (0.5 + 0.5 * dte_weight)
+        
+        # Ensure risk stays in 0-1 range
+        risk_score = min(dte_adjusted_risk, 1.0)
         
         return risk_score
     
     def get_gex_summary(self, analysis: GammaAnalysis) -> Dict[str, Any]:
         """
-        Get summary of gamma analysis.
+        Get summary of gamma analysis including DTE weighting.
         
         Args:
             analysis: Gamma analysis result
             
         Returns:
-            Summary dictionary
+            Summary dictionary with DTE metrics
         """
         return {
             "symbol": analysis.symbol,
@@ -526,4 +642,8 @@ class GammaExposureCalculator:
                 for l in analysis.gex_resistance_levels[:3]
             ],
             "gamma_risk_score": round(analysis.gamma_risk_score, 3),
+            # DTE metrics
+            "dte_days": round(analysis.dte_days, 1),
+            "dte_weight": round(analysis.dte_weight, 2),
+            "expiry_imminent": analysis.expiry_imminent,
         }

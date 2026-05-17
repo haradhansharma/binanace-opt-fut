@@ -21,6 +21,7 @@ from binance_signal_generator.models import (
     PCRAnalysis,
     OIAnalysis,
     MaxPainAnalysis,
+    GammaAnalysis,
     SentimentAnalysis,
     SignalDirection,
 )
@@ -37,11 +38,13 @@ logger = get_logger(__name__)
 class SignalScorerConfig:
     """Configuration for signal scoring."""
     # Weights for each signal type (total must equal 1.0)
-    iv_weight: float = 0.20
-    pcr_weight: float = 0.25
-    oi_weight: float = 0.20
-    max_pain_weight: float = 0.15
-    sentiment_weight: float = 0.20  # New: Sentiment from L/S ratios + funding
+    # Adjusted to include gamma exposure
+    iv_weight: float = 0.18
+    pcr_weight: float = 0.22
+    oi_weight: float = 0.18
+    max_pain_weight: float = 0.12
+    sentiment_weight: float = 0.18  # Sentiment from L/S ratios + funding
+    gamma_weight: float = 0.12  # Gamma Exposure (GEX) signal
     
     # Minimum confidence for valid signal
     min_confidence: float = 0.4
@@ -103,6 +106,7 @@ class SignalScorer:
                     "oi": self.config.oi_weight,
                     "max_pain": self.config.max_pain_weight,
                     "sentiment": self.config.sentiment_weight,
+                    "gamma": self.config.gamma_weight,
                 },
             }}
         )
@@ -111,6 +115,7 @@ class SignalScorer:
         self,
         chain: OptionsChain,
         sentiment_analysis: Optional[SentimentAnalysis] = None,
+        gamma_analysis: Optional[GammaAnalysis] = None,
     ) -> OptionsSignal:
         """
         Perform complete analysis and generate combined signal.
@@ -118,6 +123,7 @@ class SignalScorer:
         Args:
             chain: Options chain data
             sentiment_analysis: Optional sentiment analysis from L/S ratios
+            gamma_analysis: Optional gamma exposure analysis for dealer hedging
             
         Returns:
             OptionsSignal with combined analysis
@@ -128,17 +134,21 @@ class SignalScorer:
         oi_analysis = self.oi_analyzer.analyze(chain)
         max_pain_analysis = self.max_pain_calculator.calculate(chain)
         
+        # Derive gamma signal if analysis provided
+        gamma_signal, gamma_confidence = self._derive_gamma_signal(gamma_analysis, chain.spot_price)
+        
         # Debug logging
         sentiment_str = ""
         if sentiment_analysis:
             sentiment_str = f", Sentiment={sentiment_analysis.signal.value}({sentiment_analysis.signal_confidence:.2f})"
+        gamma_str = f", Gamma={gamma_signal.value}({gamma_confidence:.2f})" if gamma_analysis else ""
         logger.debug(
             f"Signal components for {chain.underlying}: "
             f"IV={iv_analysis.signal.value}({iv_analysis.confidence:.2f}), "
             f"PCR={pcr_analysis.signal.value}({pcr_analysis.confidence:.2f}), "
             f"OI={oi_analysis.signal.value}({oi_analysis.confidence:.2f}), "
             f"MaxPain={max_pain_analysis.signal.value}({max_pain_analysis.confidence:.2f})"
-            f"{sentiment_str}"
+            f"{sentiment_str}{gamma_str}"
         )
         
         # Combine signals
@@ -148,6 +158,8 @@ class SignalScorer:
             oi_analysis=oi_analysis,
             max_pain_analysis=max_pain_analysis,
             sentiment_analysis=sentiment_analysis,
+            gamma_signal=gamma_signal,
+            gamma_confidence=gamma_confidence,
         )
         
         return OptionsSignal(
@@ -160,7 +172,105 @@ class SignalScorer:
             pcr_analysis=pcr_analysis,
             oi_analysis=oi_analysis,
             max_pain_analysis=max_pain_analysis,
+            gamma_analysis=gamma_analysis,
         )
+    
+    def _derive_gamma_signal(
+        self,
+        gamma_analysis: Optional[GammaAnalysis],
+        spot_price: float,
+    ) -> tuple:
+        """
+        Derive trading signal from gamma exposure analysis.
+        
+        Gamma Exposure (GEX) Signal Logic:
+        
+        Theory:
+        - Positive GEX: Dealers are short puts → must buy underlying to hedge
+          This creates support behavior (dealers buy when price drops)
+          → BULLISH for LONG signals
+          
+        - Negative GEX: Dealers are short calls → must sell underlying to hedge
+          This creates resistance behavior (dealers sell when price rises)
+          → BEARISH, good for SHORT signals
+        
+        Signal Generation:
+        - POSITIVE GEX regime + price near/below gamma flip → LONG bias
+        - NEGATIVE GEX regime + price near/above gamma flip → SHORT bias
+        - DTE weight affects confidence (higher near expiry = stronger signal)
+        
+        Args:
+            gamma_analysis: Gamma exposure analysis result
+            spot_price: Current spot price
+            
+        Returns:
+            Tuple of (SignalDirection, confidence)
+        """
+        if not gamma_analysis:
+            return SignalDirection.NEUTRAL, 0.0
+        
+        signal = SignalDirection.NEUTRAL
+        confidence = 0.0
+        
+        # Extract key metrics
+        gex_regime = gamma_analysis.gex_regime
+        gamma_flip = gamma_analysis.gamma_flip
+        gamma_risk_score = gamma_analysis.gamma_risk_score
+        dte_weight = gamma_analysis.dte_weight
+        total_gex = gamma_analysis.total_gex
+        
+        # Determine signal based on GEX regime
+        if gex_regime == "POSITIVE":
+            # Dealers provide support (buy dips)
+            # LONG signals have better risk/reward
+            if gamma_flip and spot_price:
+                # If price is below gamma flip, support is even stronger
+                if spot_price < gamma_flip:
+                    signal = SignalDirection.LONG
+                    # Higher confidence when deeper below flip
+                    flip_distance = (gamma_flip - spot_price) / spot_price if spot_price > 0 else 0
+                    flip_score = min(flip_distance * 10, 0.5)  # Cap at 0.5
+                else:
+                    # Price above flip but still positive regime
+                    signal = SignalDirection.LONG
+                    flip_score = 0.2
+            else:
+                # No gamma flip, but positive regime still favors longs
+                signal = SignalDirection.LONG
+                flip_score = 0.3
+            
+            # Base confidence from gamma risk and DTE
+            base_confidence = min(gamma_risk_score * 0.5 + 0.3, 0.8)
+            
+        elif gex_regime == "NEGATIVE":
+            # Dealers provide resistance (sell rallies)
+            # SHORT signals have better risk/reward
+            if gamma_flip and spot_price:
+                # If price is above gamma flip, resistance is stronger
+                if spot_price > gamma_flip:
+                    signal = SignalDirection.SHORT
+                    flip_distance = (spot_price - gamma_flip) / spot_price if spot_price > 0 else 0
+                    flip_score = min(flip_distance * 10, 0.5)
+                else:
+                    signal = SignalDirection.SHORT
+                    flip_score = 0.2
+            else:
+                signal = SignalDirection.SHORT
+                flip_score = 0.3
+            
+            base_confidence = min(gamma_risk_score * 0.5 + 0.3, 0.8)
+            
+        else:  # NEUTRAL regime
+            return SignalDirection.NEUTRAL, 0.3
+        
+        # Apply DTE weight to confidence
+        # Higher DTE weight (near expiry) = more impactful gamma
+        dte_adjusted_confidence = base_confidence * (0.5 + 0.5 * min(dte_weight, 2.0))
+        
+        # Final confidence
+        confidence = min(dte_adjusted_confidence + flip_score, 0.9)
+        
+        return signal, round(confidence, 3)
     
     def _combine_signals(
         self,
@@ -169,6 +279,8 @@ class SignalScorer:
         oi_analysis: OIAnalysis,
         max_pain_analysis: MaxPainAnalysis,
         sentiment_analysis: Optional[SentimentAnalysis] = None,
+        gamma_signal: SignalDirection = SignalDirection.NEUTRAL,
+        gamma_confidence: float = 0.0,
     ) -> tuple:
         """
         Combine multiple signals into one.
@@ -179,6 +291,8 @@ class SignalScorer:
             oi_analysis: OI analysis result
             max_pain_analysis: Max Pain analysis result
             sentiment_analysis: Optional sentiment analysis from L/S ratios
+            gamma_signal: Signal derived from gamma exposure
+            gamma_confidence: Confidence of gamma signal
             
         Returns:
             Tuple of (SignalDirection, confidence, raw_score)
@@ -201,6 +315,9 @@ class SignalScorer:
         else:
             signals["sentiment"] = 0.0
         
+        # Add gamma signal
+        signals["gamma"] = self._signal_to_numeric(gamma_signal) * gamma_confidence
+        
         # Apply weights
         weighted_signals = {
             "iv": signals["iv"] * self.config.iv_weight,
@@ -208,12 +325,13 @@ class SignalScorer:
             "oi": signals["oi"] * self.config.oi_weight,
             "max_pain": signals["max_pain"] * self.config.max_pain_weight,
             "sentiment": signals["sentiment"] * self.config.sentiment_weight,
+            "gamma": signals["gamma"] * self.config.gamma_weight,
         }
         
         # Calculate raw score
         raw_score = sum(weighted_signals.values())
         
-        # Calculate agreement (include sentiment if available)
+        # Calculate agreement (include all signals)
         signal_list = [
             iv_analysis.signal,
             pcr_analysis.signal,
@@ -222,6 +340,8 @@ class SignalScorer:
         ]
         if sentiment_analysis:
             signal_list.append(sentiment_analysis.signal)
+        if gamma_signal != SignalDirection.NEUTRAL:
+            signal_list.append(gamma_signal)
         agreement = self._calculate_agreement(*signal_list)
         
         # Determine direction
@@ -331,6 +451,17 @@ class SignalScorer:
                 "max_pain_strike": round(signal.max_pain_analysis.max_pain_strike, 2),
                 "distance_pct": round(signal.max_pain_analysis.distance_pct, 2),
                 "magnet_strength": round(signal.max_pain_analysis.magnet_strength, 3),
+            }
+        
+        if signal.gamma_analysis:
+            breakdown["components"]["gamma"] = {
+                "gex_regime": signal.gamma_analysis.gex_regime,
+                "dealer_hedge_pressure": signal.gamma_analysis.dealer_hedge_pressure,
+                "gamma_flip": round(signal.gamma_analysis.gamma_flip, 2) if signal.gamma_analysis.gamma_flip else None,
+                "gamma_risk_score": round(signal.gamma_analysis.gamma_risk_score, 3),
+                "dte_days": round(signal.gamma_analysis.dte_days, 1),
+                "dte_weight": round(signal.gamma_analysis.dte_weight, 2),
+                "expiry_imminent": signal.gamma_analysis.expiry_imminent,
             }
         
         return breakdown
