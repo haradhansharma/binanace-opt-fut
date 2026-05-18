@@ -806,11 +806,14 @@ class SignalScorer:
         }
         
         # Add sentiment signal if available
+        # BUG FIX: Removed contrarian flip — sentiment.py's _determine_signal() already
+        # produces the correct trading direction. When L/S ratio > 3.0 (extreme long
+        # positioning), it correctly returns SHORT with is_contrarian=True. Flipping
+        # it back here (-(-1.0) = +1.0) would make it contribute as LONG, which is
+        # wrong. The contrarian flag is informational only; the signal direction is
+        # already the correct trading direction.
         if sentiment_analysis:
             sentiment_numeric = self._signal_to_numeric(sentiment_analysis.signal)
-            # If contrarian, flip the signal direction for scoring
-            if sentiment_analysis.is_contrarian_signal:
-                sentiment_numeric = -sentiment_numeric
             signals["sentiment"] = sentiment_numeric * sentiment_analysis.signal_confidence
         else:
             signals["sentiment"] = 0.0

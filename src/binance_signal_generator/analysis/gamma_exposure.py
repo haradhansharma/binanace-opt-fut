@@ -439,11 +439,17 @@ class GammaExposureCalculator:
             prev_cumulative = cumulative_gex
             prev_strike = strike
         
-        # No flip found - return spot if all positive, or None if all negative
+        # No flip found - return estimated level based on GEX direction
+        # BUG FIX: Previously, positive GEX returned spot * 0.9 (fabricated
+        # support level) while negative GEX returned None. This was asymmetric —
+        # positive GEX always had a "flip" value steering gamma signal toward LONG,
+        # while negative GEX got no equivalent resistance level. Now both return
+        # estimated levels: positive GEX gets estimated support, negative GEX gets
+        # estimated resistance.
         if cumulative_gex > 0:
-            return spot * 0.9  # Estimated support level
+            return spot * 0.9   # Estimated support level (10% below spot)
         else:
-            return None
+            return spot * 1.1   # Estimated resistance level (10% above spot)
     
     def _identify_gex_levels(
         self,

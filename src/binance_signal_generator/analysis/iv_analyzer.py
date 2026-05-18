@@ -352,7 +352,11 @@ class IVAnalyzer:
                     return SignalDirection.NEUTRAL, 0.3
             else:
                 # Low IV with positive/neutral skew
-                return SignalDirection.LONG, 0.35
+                # BUG FIX: Previously defaulted to LONG, 0.35 — asymmetric with
+                # HIGH IV default of NEUTRAL, 0.3. Low IV alone doesn't guarantee
+                # bullish direction; it just means options are cheap. Without a
+                # clear directional skew, NEUTRAL is the appropriate default.
+                return SignalDirection.NEUTRAL, 0.3
         
         # Normal IV regime
         else:

@@ -319,10 +319,14 @@ class WhaleDetector:
         
         for trade in whale_trades:
             # Track by sentiment
+            # BUG FIX: NEUTRAL trades were previously counted as sell_volume,
+            # inflating the bearish side. NEUTRAL trades have no directional bias
+            # and should not contribute to either buy_volume or sell_volume.
             if trade.inferred_sentiment == "BULLISH":
                 buy_volume += trade.premium
-            else:
+            elif trade.inferred_sentiment == "BEARISH":
                 sell_volume += trade.premium
+            # NEUTRAL trades are excluded from buy/sell volume
             
             # Track by option type
             if trade.option_type == "CALL":

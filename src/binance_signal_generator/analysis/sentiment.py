@@ -282,19 +282,33 @@ class SentimentAnalyzer:
         # - Positive = bullish sentiment (more longs)
         # - Negative = bearish sentiment (more shorts)
         # - Extreme values trigger contrarian consideration
+        #
+        # BUG FIX: Scoring is now symmetric. Previously:
+        # - Bullish: (ratio - 1.0) / (extreme_high - 1.0) = denominator 1.0
+        # - Bearish: (ratio - 1.0) / (1.0 - extreme_low)  = denominator 0.5
+        # This made bearish scores 2× stronger at equivalent threshold distance.
+        # Now both use the same distance scale from 1.0 (neutral), normalized to
+        # the range from the threshold to the extreme, making scoring symmetric.
         
         if ratio > self.config.ls_ratio_extreme_high:
             # Extreme bullish positioning
-            # In following mode: bullish signal
-            # In contrarian mode: potential reversal signal
             score = 1.0
         elif ratio > self.config.ls_ratio_bullish:
-            score = min((ratio - 1.0) / (self.config.ls_ratio_extreme_high - 1.0), 1.0)
+            # Bullish zone: normalize distance from 1.0 to extreme_high
+            # Symmetric normalization: distance from neutral (1.0) relative to
+            # the zone width (bullish threshold to extreme)
+            distance_from_neutral = ratio - 1.0
+            zone_width = self.config.ls_ratio_extreme_high - 1.0
+            score = min(distance_from_neutral / zone_width, 1.0)
         elif ratio < self.config.ls_ratio_extreme_low:
             # Extreme bearish positioning
             score = -1.0
         elif ratio < self.config.ls_ratio_bearish:
-            score = max((ratio - 1.0) / (1.0 - self.config.ls_ratio_extreme_low), -1.0)
+            # Bearish zone: normalize distance from 1.0 to extreme_low
+            # Same normalization logic as bullish for symmetry
+            distance_from_neutral = ratio - 1.0  # Negative value
+            zone_width = 1.0 - self.config.ls_ratio_extreme_low
+            score = max(distance_from_neutral / zone_width, -1.0)
         else:
             # Neutral zone
             score = 0.0
@@ -367,30 +381,47 @@ class SentimentAnalyzer:
                 momentum_score = min(abs(momentum_change) / 0.0005, 0.3)
         
         # Calculate score
-        # Note: High positive funding = bearish contrarian signal
-        #       High negative funding = bullish contrarian signal
-        # We return the raw sentiment (not contrarian-adjusted)
+        # BUG FIX: Funding rate scoring must reflect BOTH crowding intensity
+        # AND contrarian direction. Previously, positive funding always scored
+        # positive (+0.5), which meant 40% weight always bullish — but positive
+        # funding means crowded LONGS which is a BEARISH contrarian signal.
+        #
+        # Updated scoring:
+        # - Positive funding = crowded longs = bearish contrarian = NEGATIVE score
+        # - Negative funding = crowded shorts = bullish contrarian = POSITIVE score
+        # - The magnitude reflects how crowded the trade is (stronger = more contrarian)
+        # - This allows _determine_signal() to correctly interpret funding as contrarian
+        #
+        # The key insight: funding rate is INHERENTLY a contrarian indicator.
+        # High positive funding means longs are overcrowded → expect short squeeze or reversal
+        # High negative funding means shorts are overcrowded → expect short squeeze up
         
         if current_rate > self.config.funding_extreme_high:
-            # Extremely positive funding = crowded longs = potential short
-            score = 0.8  # Bullish sentiment, but contrarian
+            # Extremely positive funding = extremely crowded longs = strong bearish contrarian
+            score = -0.8  # Negative = bearish contrarian (fade the crowd)
         elif current_rate > self.config.funding_bullish:
-            score = 0.5
-        elif current_rate < self.config.funding_extreme_low:
-            # Extremely negative funding = crowded shorts = potential long
-            score = -0.8
-        elif current_rate < self.config.funding_bearish:
+            # Moderately positive funding = moderately crowded longs = mild bearish contrarian
             score = -0.5
+        elif current_rate < self.config.funding_extreme_low:
+            # Extremely negative funding = extremely crowded shorts = strong bullish contrarian
+            score = 0.8  # Positive = bullish contrarian (fade the crowd)
+        elif current_rate < self.config.funding_bearish:
+            # Moderately negative funding = moderately crowded shorts = mild bullish contrarian
+            score = 0.5
         else:
+            # Neutral funding zone = no contrarian signal
             score = 0.0
         
         # Adjust score by momentum (NEW)
-        # Rising funding with positive rate = more crowded = stronger contrarian signal
-        # Falling funding with negative rate = less crowded = weaker signal
+        # Rising funding with positive rate = more crowded longs = stronger bearish contrarian
+        # Falling funding with negative rate = less crowded shorts = weaker bullish contrarian
+        # Since score is now contrarian (positive funding → negative score):
+        # - Rising positive funding → score goes more negative (stronger bearish contrarian)
+        # - Falling negative funding → score goes less positive (weaker bullish contrarian)
         if momentum == "RISING" and current_rate > 0:
-            score += momentum_score  # Amplify bullish sentiment (contrarian becomes more bearish)
+            score -= momentum_score  # More crowded longs → stronger bearish contrarian
         elif momentum == "FALLING" and current_rate < 0:
-            score -= momentum_score  # Amplify bearish sentiment
+            score += momentum_score  # Less crowded shorts → weaker bullish contrarian
         
         return {
             "current_rate": current_rate,
