@@ -133,7 +133,7 @@ class GammaExposureCalculator:
         )
         
         # Calculate GEX at each strike with DTE weighting
-        strike_gex = self._calculate_strike_gex(chain, spot, dte_weight)
+        strike_gex = self._calculate_strike_gex(chain, spot, dte_weight, dte_days=dte)
         
         # Calculate aggregate metrics
         total_call_gex = sum(g['call_gex'] for g in strike_gex.values())
@@ -288,6 +288,7 @@ class GammaExposureCalculator:
         chain: OptionsChain,
         spot: float,
         dte_weight: float = 1.0,
+        dte_days: float = 7.0,
     ) -> Dict[float, Dict[str, float]]:
         """
         Calculate GEX at each strike with DTE weighting.
@@ -320,10 +321,13 @@ class GammaExposureCalculator:
                 continue
             
             # Calculate gamma for calls and puts
-            # Simplified: Gamma ≈ 1 / (spot × sqrt(2π)) for ATM, scaled for moneyness
-            # Apply DTE weighting to gamma
-            call_gamma = self._estimate_gamma(spot, strike_price, "CALL") * dte_weight
-            put_gamma = self._estimate_gamma(spot, strike_price, "PUT") * dte_weight
+            # FIX: Pass IV from strike data and DTE to make gamma estimation adaptive
+            call_iv = strike_data.call.iv if strike_data.call.iv > 0 else 0.6
+            put_iv = strike_data.put.iv if strike_data.put.iv > 0 else 0.6
+            avg_iv = (call_iv + put_iv) / 2
+            
+            call_gamma = self._estimate_gamma(spot, strike_price, "CALL", iv=avg_iv, dte=dte_days) * dte_weight
+            put_gamma = self._estimate_gamma(spot, strike_price, "PUT", iv=avg_iv, dte=dte_days) * dte_weight
             
             # GEX formula: OI × Gamma × 100 × Spot² × 0.01
             # The 100 is contract multiplier, 0.01 is for 1% move
@@ -356,19 +360,29 @@ class GammaExposureCalculator:
         spot: float,
         strike: float,
         option_type: str,
+        iv: float = 0.6,
+        dte: float = 7.0,
     ) -> float:
         """
         Estimate gamma for an option.
         
-        Simplified gamma approximation:
-        Gamma ≈ n(d1) / (S × σ × sqrt(T))
+        FIX: Now scales with IV (sigma) and DTE (time to expiry).
+        By Black-Scholes: Gamma ≈ n(d1) / (S × σ × √T)
+        Previously, hardcoded values (0.002, 0.010, 0.015) didn't scale
+        with IV or DTE, causing:
+        - High IV environments to underestimate gamma
+        - Low IV environments to overestimate gamma
+        - All DTE values getting the same gamma
         
-        For our purposes, we use a simplified approach based on moneyness.
+        The base values are calibrated for IV=60%, DTE=7 days.
+        Scaling: gamma *= (0.6 / IV) * sqrt(7 / DTE)
         
         Args:
             spot: Current spot price
             strike: Strike price
             option_type: "CALL" or "PUT"
+            iv: Implied volatility (default 0.6 for crypto)
+            dte: Days to expiry (default 7.0)
             
         Returns:
             Estimated gamma value
@@ -376,24 +390,27 @@ class GammaExposureCalculator:
         # Moneyness
         moneyness = strike / spot if spot > 0 else 1.0
         
-        # Simplified gamma based on moneyness
-        # ATM options have highest gamma, OTM have lower
-        # Gamma peak is near ATM
-        
+        # Base gamma based on moneyness (calibrated at IV=0.6, DTE=7)
         if moneyness < 0.7 or moneyness > 1.3:
-            # Deep OTM or ITM - low gamma
-            gamma = 0.002
+            base_gamma = 0.002  # Deep OTM or ITM - low gamma
         elif 0.85 <= moneyness <= 1.15:
-            # Near ATM - highest gamma
-            # Peak at ATM (moneyness = 1.0)
             distance_from_atm = abs(moneyness - 1.0)
-            gamma = 0.015 * (1 - distance_from_atm / 0.15)
+            base_gamma = 0.015 * (1 - distance_from_atm / 0.15)  # Near ATM - highest
         else:
-            # Slightly OTM/ITM - moderate gamma
             distance_from_atm = abs(moneyness - 1.0)
-            gamma = 0.010 * (1 - distance_from_atm / 0.3)
+            base_gamma = 0.010 * (1 - distance_from_atm / 0.3)  # Slightly OTM/ITM
         
-        return max(gamma, 0.001)  # Minimum gamma
+        # FIX: Scale gamma by IV and DTE
+        # Gamma ∝ 1/(σ×√T), so normalize relative to reference (IV=0.6, DTE=7)
+        iv = max(iv, 0.1)  # Minimum IV to avoid division by zero
+        dte = max(dte, 0.1)  # Minimum DTE
+        
+        iv_scaling = 0.6 / iv  # Higher IV → lower gamma
+        dte_scaling = math.sqrt(7.0 / dte)  # Shorter DTE → higher gamma
+        
+        gamma = base_gamma * iv_scaling * dte_scaling
+        
+        return max(gamma, 0.0005)  # Minimum gamma
     
     def _find_gamma_flip(
         self,
@@ -439,17 +456,15 @@ class GammaExposureCalculator:
             prev_cumulative = cumulative_gex
             prev_strike = strike
         
-        # No flip found - return estimated level based on GEX direction
-        # BUG FIX: Previously, positive GEX returned spot * 0.9 (fabricated
-        # support level) while negative GEX returned None. This was asymmetric —
-        # positive GEX always had a "flip" value steering gamma signal toward LONG,
-        # while negative GEX got no equivalent resistance level. Now both return
-        # estimated levels: positive GEX gets estimated support, negative GEX gets
-        # estimated resistance.
-        if cumulative_gex > 0:
-            return spot * 0.9   # Estimated support level (10% below spot)
-        else:
-            return spot * 1.1   # Estimated resistance level (10% above spot)
+        # No flip found in the data
+        # FIX: Previously fabricated levels at spot±10% which then influenced
+        # signal direction as if they were real. Now return None to indicate
+        # no actual gamma flip exists, and signal_scorer handles this correctly.
+        logger.debug(
+            f"No gamma flip found in data for {spot:.0f} "
+            f"(cumulative_gex={cumulative_gex:.0f})"
+        )
+        return None
     
     def _identify_gex_levels(
         self,

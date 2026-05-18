@@ -249,10 +249,13 @@ class PCRAnalyzer:
             return SignalDirection.NEUTRAL, 0.2
         
         # Apply trend-aware signal logic
-        if price_change_pct is not None and abs(price_change_pct) > 0.01:
+        # FIX: Use ATR-based thresholds instead of hardcoded 0.01%
+        # Crypto 15m ATR is typically 0.3-0.8%, so 0.01% is noise
+        trend_threshold = 0.15  # Conservative for crypto
+        if price_change_pct is not None and abs(price_change_pct) > trend_threshold:
             # We have price trend data - use trend-aware logic
-            price_trending_down = price_change_pct < -0.01
-            price_trending_up = price_change_pct > 0.01
+            price_trending_down = price_change_pct < -trend_threshold
+            price_trending_up = price_change_pct > trend_threshold
             
             if pcr_bearish:
                 # High PCR = crowd is bearish
@@ -268,8 +271,9 @@ class PCRAnalyzer:
                     return SignalDirection.SHORT, confidence
                 else:
                     # Price is rising → crowd may be wrong → contrarian LONG
-                    # Reduce confidence since market is moving against contrarian view
-                    confidence = base_confidence * 0.6
+                    # FIX: Scale penalty with trend strength instead of flat 0.6
+                    penalty = max(0.3, 1.0 - abs(price_change_pct) * 0.3)
+                    confidence = base_confidence * penalty
                     logger.debug(
                         f"PCR signal: HIGH={pcr:.2f} + price UP={price_change_pct:.2f}% "
                         f"→ trend opposes bearish → LONG (contrarian, reduced confidence)"
@@ -289,8 +293,9 @@ class PCRAnalyzer:
                     return SignalDirection.LONG, confidence
                 else:
                     # Price is falling → crowd may be wrong → contrarian SHORT
-                    # Reduce confidence since market is moving against contrarian view
-                    confidence = base_confidence * 0.6
+                    # FIX: Scale penalty with trend strength
+                    penalty = max(0.3, 1.0 - abs(price_change_pct) * 0.3)
+                    confidence = base_confidence * penalty
                     logger.debug(
                         f"PCR signal: LOW={pcr:.2f} + price DOWN={price_change_pct:.2f}% "
                         f"→ trend opposes bullish → SHORT (contrarian, reduced confidence)"

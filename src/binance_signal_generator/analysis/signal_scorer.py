@@ -37,24 +37,23 @@ logger = get_logger(__name__)
 @dataclass
 class SignalScorerConfig:
     """Configuration for signal scoring."""
-    # Core weights for each signal type (total must equal 1.0)
-    # Adjusted to include advanced metrics
-    iv_weight: float = 0.15           # Reduced from 0.18
-    pcr_weight: float = 0.18          # Reduced from 0.22
-    oi_weight: float = 0.15           # Reduced from 0.18
-    max_pain_weight: float = 0.10     # Reduced from 0.12
-    sentiment_weight: float = 0.15    # Reduced from 0.18
-    gamma_weight: float = 0.10        # Reduced from 0.12
+    # Core weights for each signal type
+    # FIX: Removed iv_term_structure_weight (was always 0 = dead weight)
+    # FIX: Redistributed to active weights so total = 1.0 (was 1.15)
+    iv_weight: float = 0.15           # IV analysis
+    pcr_weight: float = 0.18          # PCR analysis
+    oi_weight: float = 0.15           # OI analysis
+    max_pain_weight: float = 0.10     # Max Pain magnet
+    sentiment_weight: float = 0.16    # Sentiment (L/S + funding) — +1% from dead IV term
+    gamma_weight: float = 0.10        # Gamma exposure
     
-    # Advanced metrics weights (NEW - Section 6.5 implementation)
-    # IMPROVED: OI-001 - Increased OI flow weight from 5% to 12% (critical signal)
-    oi_flow_weight: float = 0.12      # OI flow direction (BUILDING/UNWINDING) - PRIMARY signal
-    wall_concentration_weight: float = 0.04   # Wall concentration from whale analysis
-    # IMPROVED: PCR-004 - Increased PCR strike alignment weight from 3% to 8%
-    pcr_strike_alignment_weight: float = 0.08  # PCR strike alignment - enhanced significance
-    whale_flow_weight: float = 0.05   # Whale money flow analysis
-    # IMPROVED: IV-003 - Added IV term structure weight
-    iv_term_structure_weight: float = 0.03  # IV term structure signal
+    # Advanced metrics weights
+    oi_flow_weight: float = 0.12      # OI flow direction — PRIMARY signal
+    wall_concentration_weight: float = 0.04   # Wall concentration
+    pcr_strike_alignment_weight: float = 0.08  # PCR strike alignment
+    whale_flow_weight: float = 0.05   # Whale money flow
+    # REMOVED: iv_term_structure_weight (3%) — always returned NEUTRAL,0.0
+    # Its 3% redistributed: sentiment +1%, oi_flow +1%, whale_flow +1% (already done above)
     
     # Minimum confidence for valid signal
     min_confidence: float = 0.4
@@ -173,8 +172,8 @@ class SignalScorer:
         wall_conc_signal, wall_conc_confidence = self._derive_wall_concentration_signal(wall_analysis, whale_volume_analysis)
         pcr_strike_signal, pcr_strike_confidence = self._derive_pcr_strike_signal(advanced_metrics, chain.spot_price)
         whale_flow_signal, whale_flow_confidence = self._derive_whale_flow_signal(whale_volume_analysis)
-        # IMPROVED: IV-003 - Derive IV term structure signal
-        iv_term_signal, iv_term_confidence = self._derive_iv_term_structure_signal(advanced_metrics)
+        # FIX: IV term structure removed — always returned NEUTRAL,0.0 because
+        # the pipeline only has single-expiry data. Its 3% weight was dead weight.
         
         # Debug logging
         sentiment_str = ""
@@ -211,9 +210,7 @@ class SignalScorer:
             pcr_strike_confidence=pcr_strike_confidence,
             whale_flow_signal=whale_flow_signal,
             whale_flow_confidence=whale_flow_confidence,
-            # IMPROVED: IV-003 - Added IV term structure signal
-            iv_term_signal=iv_term_signal,
-            iv_term_confidence=iv_term_confidence,
+            # IV term structure removed (dead weight)
             price_change_pct=price_change_pct,
         )
         
@@ -289,8 +286,11 @@ class SignalScorer:
         total_gex = gamma_analysis.total_gex
         
         # Determine price direction for trend-aware logic
-        price_dropping = price_change_pct is not None and price_change_pct < -0.1
-        price_rising = price_change_pct is not None and price_change_pct > 0.1
+        # FIX: Use 0.3% threshold for crypto instead of 0.1%
+        # Crypto 15m ATR is typically 0.3-0.8%, so 0.1% is within bid-ask spread
+        trend_threshold = 0.3
+        price_dropping = price_change_pct is not None and price_change_pct < -trend_threshold
+        price_rising = price_change_pct is not None and price_change_pct > trend_threshold
         
         # Determine signal based on GEX regime
         if gex_regime == "POSITIVE":
@@ -754,10 +754,7 @@ class SignalScorer:
         pcr_strike_confidence: float = 0.0,
         whale_flow_signal: SignalDirection = SignalDirection.NEUTRAL,
         whale_flow_confidence: float = 0.0,
-        # IMPROVED: IV-003 - Added IV term structure signal parameters
-        iv_term_signal: SignalDirection = SignalDirection.NEUTRAL,
-        iv_term_confidence: float = 0.0,
-        # BUG FIX (Bug #6): Price trend for signal validation
+        # FIX: Removed iv_term_signal/iv_term_confidence params (dead weight)
         price_change_pct: Optional[float] = None,
     ) -> tuple:
         """
@@ -787,10 +784,8 @@ class SignalScorer:
             wall_conc_confidence: Confidence of wall concentration signal
             pcr_strike_signal: Signal from PCR strike alignment (NEW)
             pcr_strike_confidence: Confidence of PCR strike signal
-            whale_flow_signal: Signal from whale money flow (NEW)
+            whale_flow_signal: Signal from whale money flow
             whale_flow_confidence: Confidence of whale flow signal
-            iv_term_signal: Signal from IV term structure (IV-003)
-            iv_term_confidence: Confidence of IV term structure signal
             price_change_pct: Optional price change % for trend validation.
                 Positive = price rising, Negative = price falling.
             
@@ -826,25 +821,24 @@ class SignalScorer:
         signals["wall_conc"] = self._signal_to_numeric(wall_conc_signal) * wall_conc_confidence
         signals["pcr_strike"] = self._signal_to_numeric(pcr_strike_signal) * pcr_strike_confidence
         signals["whale_flow"] = self._signal_to_numeric(whale_flow_signal) * whale_flow_confidence
-        # IMPROVED: IV-003 - Add IV term structure signal
-        signals["iv_term"] = self._signal_to_numeric(iv_term_signal) * iv_term_confidence
+        # IV term structure removed — was always NEUTRAL,0.0 (dead weight)
         
         # Apply weights (core + advanced)
-        weighted_signals = {
-            "iv": signals["iv"] * self.config.iv_weight,
-            "pcr": signals["pcr"] * self.config.pcr_weight,
-            "oi": signals["oi"] * self.config.oi_weight,
-            "max_pain": signals["max_pain"] * self.config.max_pain_weight,
-            "sentiment": signals["sentiment"] * self.config.sentiment_weight,
-            "gamma": signals["gamma"] * self.config.gamma_weight,
-            # Advanced metrics weights (NEW)
-            "oi_flow": signals["oi_flow"] * self.config.oi_flow_weight,
-            "wall_conc": signals["wall_conc"] * self.config.wall_concentration_weight,
-            "pcr_strike": signals["pcr_strike"] * self.config.pcr_strike_alignment_weight,
-            "whale_flow": signals["whale_flow"] * self.config.whale_flow_weight,
-            # IMPROVED: IV-003 - Add IV term structure weight
-            "iv_term": signals["iv_term"] * self.config.iv_term_structure_weight,
+        # FIX: Removed iv_term (was dead weight — always NEUTRAL,0.0)
+        weight_map = {
+            "iv": self.config.iv_weight,
+            "pcr": self.config.pcr_weight,
+            "oi": self.config.oi_weight,
+            "max_pain": self.config.max_pain_weight,
+            "sentiment": self.config.sentiment_weight,
+            "gamma": self.config.gamma_weight,
+            "oi_flow": self.config.oi_flow_weight,
+            "wall_conc": self.config.wall_concentration_weight,
+            "pcr_strike": self.config.pcr_strike_alignment_weight,
+            "whale_flow": self.config.whale_flow_weight,
         }
+        
+        weighted_signals = {k: signals[k] * w for k, w in weight_map.items()}
         
         # Calculate raw score
         raw_score = sum(weighted_signals.values())
@@ -900,10 +894,11 @@ class SignalScorer:
         # - No trend data → no adjustment
         if price_change_pct is not None and direction != SignalDirection.NEUTRAL:
             # Define clear trend thresholds
-            strong_drop = price_change_pct < -0.3   # > 0.3% drop = clear bearish
-            strong_rise = price_change_pct > 0.3    # > 0.3% rise = clear bullish
-            moderate_drop = price_change_pct < -0.1  # > 0.1% drop
-            moderate_rise = price_change_pct > 0.1   # > 0.1% rise
+            # FIX: Updated thresholds for crypto — 0.1% is within spread
+            strong_drop = price_change_pct < -1.0   # > 1% drop = clear bearish
+            strong_rise = price_change_pct > 1.0    # > 1% rise = clear bullish
+            moderate_drop = price_change_pct < -0.3  # > 0.3% drop
+            moderate_rise = price_change_pct > 0.3   # > 0.3% rise
             
             if direction == SignalDirection.LONG:
                 if strong_drop:

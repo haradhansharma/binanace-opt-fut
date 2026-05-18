@@ -811,10 +811,22 @@ class PipelineOrchestrator:
             strength = SignalStrength.WEAK
         
         # Calculate entry zone (around current price)
+        # FIX: Use ATR-based entry width instead of fixed 0.5%
+        # Crypto volatility varies widely — 0.5% is too tight for volatile moves
         current_price = futures_data.price
+        # Estimate ATR_pct from futures data if available
+        atr_pct = 0.5  # Conservative fallback
+        if hasattr(futures_data, 'klines') and futures_data.klines:
+            # Use recent candle range as ATR proxy
+            recent_candles = futures_data.klines[-14:] if len(futures_data.klines) >= 14 else futures_data.klines
+            if recent_candles:
+                atr_values = [(c.high - c.low) / c.close * 100 for c in recent_candles if c.close > 0]
+                if atr_values:
+                    atr_pct = sum(atr_values) / len(atr_values)
+        entry_half_width = max(atr_pct * 0.5, 0.2) / 100  # Half ATR, min 0.2%
         entry_zone = EntryZone(
-            min=current_price * 0.995,  # 0.5% below
-            max=current_price * 1.005,  # 0.5% above
+            min=current_price * (1 - entry_half_width),
+            max=current_price * (1 + entry_half_width),
             ideal=current_price,
         )
 
@@ -864,6 +876,7 @@ class PipelineOrchestrator:
             gamma_analysis=gamma_analysis,
             support_levels=support_levels,
             resistance_levels=resistance_levels,
+            stop_loss=stop_loss,
         )
         
         # Build whale metrics
@@ -1415,6 +1428,7 @@ class PipelineOrchestrator:
         gamma_analysis: Optional[Any],
         support_levels: List[Dict],
         resistance_levels: List[Dict],
+        stop_loss: Optional[StopLoss] = None,
     ) -> List[TakeProfitLevel]:
         """
         Calculate smart take profit levels with type information.
@@ -1430,6 +1444,7 @@ class PipelineOrchestrator:
             gamma_analysis: Gamma exposure analysis
             support_levels: Pre-built support levels
             resistance_levels: Pre-built resistance levels
+            stop_loss: Computed stop loss (used for risk-reward ratio calculation)
             
         Returns:
             List of TakeProfitLevel with smart targets
@@ -1484,8 +1499,10 @@ class PipelineOrchestrator:
             tp_distance = candidate[1]
             tp_type = candidate[2]
             
-            # RR ratio based on distance (assuming ~2% SL)
-            rr_ratio = round(tp_distance / 2.0, 1)
+            # FIX: RR ratio based on actual SL distance, not hardcoded 2%
+            # The stop_loss is passed from the caller where it's already computed
+            sl_distance = stop_loss.distance_pct if stop_loss and stop_loss.distance_pct > 0 else 2.0
+            rr_ratio = round(tp_distance / sl_distance, 1)
             
             levels.append(TakeProfitLevel(
                 level=i + 1,

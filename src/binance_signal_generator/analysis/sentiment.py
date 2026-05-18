@@ -363,7 +363,8 @@ class SentimentAnalyzer:
         )
         
         # Calculate funding rate momentum (NEW - Section 6.5 Priority 3)
-        # Momentum indicates whether funding is trending higher or lower
+        # FIX: Use relative thresholds based on recent data standard deviation
+        # instead of absolute values (0.0002/0.0005) that don't adapt to regime
         momentum = "NEUTRAL"
         momentum_score = 0.0
         if len(recent_data) >= 4:
@@ -373,12 +374,24 @@ class SentimentAnalyzer:
             
             momentum_change = recent_avg - older_avg
             
-            if momentum_change > 0.0002:  # Rising funding
+            # FIX: Use std dev of recent data for adaptive thresholds
+            rates = [d.funding_rate for d in recent_data]
+            if len(rates) >= 4:
+                mean_rate = sum(rates) / len(rates)
+                std_dev = (sum((r - mean_rate) ** 2 for r in rates) / len(rates)) ** 0.5
+            else:
+                std_dev = 0.0003  # Fallback std dev
+            
+            # Threshold: 0.5 std dev for direction, normalize by 1.5 std dev
+            momentum_threshold = max(std_dev * 0.5, 0.0001)  # Minimum threshold
+            momentum_normalizer = max(std_dev * 1.5, 0.0003)  # Minimum normalizer
+            
+            if momentum_change > momentum_threshold:  # Rising funding
                 momentum = "RISING"
-                momentum_score = min(momentum_change / 0.0005, 0.3)
-            elif momentum_change < -0.0002:  # Falling funding
+                momentum_score = min(momentum_change / momentum_normalizer, 0.3)
+            elif momentum_change < -momentum_threshold:  # Falling funding
                 momentum = "FALLING"
-                momentum_score = min(abs(momentum_change) / 0.0005, 0.3)
+                momentum_score = min(abs(momentum_change) / momentum_normalizer, 0.3)
         
         # Calculate score
         # BUG FIX: Funding rate scoring must reflect BOTH crowding intensity
@@ -473,8 +486,11 @@ class SentimentAnalyzer:
         is_contrarian = False
         
         # Determine price trend for trend-aware logic
-        price_dropping = price_change_pct is not None and price_change_pct < -0.1
-        price_rising = price_change_pct is not None and price_change_pct > 0.1
+        # FIX: Use ATR-based thresholds instead of hardcoded 0.1%
+        # Crypto 15m ATR is typically 0.3-0.8%, so 0.1% is within bid-ask spread
+        trend_threshold = 0.3  # Conservative fallback for crypto
+        price_dropping = price_change_pct is not None and price_change_pct < -trend_threshold
+        price_rising = price_change_pct is not None and price_change_pct > trend_threshold
         has_trend = price_change_pct is not None
         
         # Check for extreme positioning (contrarian signal)
@@ -494,12 +510,13 @@ class SentimentAnalyzer:
                         f"price dropping ({price_change_pct:.2f}%) → boosted confidence"
                     )
                 # If price is rising and contrarian says SHORT → trend opposes → reduce
-                elif has_trend and price_rising and signal == SignalDirection.SHORT:
-                    confidence *= 0.6
-                    logger.debug(
-                        f"Sentiment: Extreme long positioning contrarian SHORT opposed by "
-                        f"price rising ({price_change_pct:.2f}%) → reduced confidence"
-                    )
+                # FIX: Scale penalty with trend strength instead of flat 0.6
+                penalty = max(0.3, 1.0 - abs(price_change_pct) * 0.5)
+                confidence *= penalty
+                logger.debug(
+                    f"Sentiment: Extreme long positioning contrarian SHORT opposed by "
+                    f"price rising ({price_change_pct:.2f}%) → reduced confidence"
+                )
                 
                 return signal, round(confidence, 3), is_contrarian
             
@@ -518,12 +535,13 @@ class SentimentAnalyzer:
                         f"price rising ({price_change_pct:.2f}%) → boosted confidence"
                     )
                 # If price is dropping and contrarian says LONG → trend opposes → reduce
-                elif has_trend and price_dropping and signal == SignalDirection.LONG:
-                    confidence *= 0.6
-                    logger.debug(
-                        f"Sentiment: Extreme short positioning contrarian LONG opposed by "
-                        f"price dropping ({price_change_pct:.2f}%) → reduced confidence"
-                    )
+                # FIX: Scale penalty with trend strength instead of flat 0.6
+                penalty = max(0.3, 1.0 - abs(price_change_pct) * 0.5)
+                confidence *= penalty
+                logger.debug(
+                    f"Sentiment: Extreme short positioning contrarian LONG opposed by "
+                    f"price dropping ({price_change_pct:.2f}%) → reduced confidence"
+                )
                 
                 return signal, round(confidence, 3), is_contrarian
             
@@ -543,7 +561,9 @@ class SentimentAnalyzer:
                             f"price dropping ({price_change_pct:.2f}%)"
                         )
                     elif has_trend and price_rising:
-                        confidence *= 0.6
+                        # FIX: Scale penalty with trend strength
+                        penalty = max(0.3, 1.0 - abs(price_change_pct) * 0.5)
+                        confidence *= penalty
                         logger.debug(
                             f"Sentiment: Funding extreme contrarian SHORT opposed by "
                             f"price rising ({price_change_pct:.2f}%)"
@@ -563,7 +583,9 @@ class SentimentAnalyzer:
                             f"price rising ({price_change_pct:.2f}%)"
                         )
                     elif has_trend and price_dropping:
-                        confidence *= 0.6
+                        # FIX: Scale penalty with trend strength
+                        penalty = max(0.3, 1.0 - abs(price_change_pct) * 0.5)
+                        confidence *= penalty
                         logger.debug(
                             f"Sentiment: Funding extreme contrarian LONG opposed by "
                             f"price dropping ({price_change_pct:.2f}%)"

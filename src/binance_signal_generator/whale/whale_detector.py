@@ -353,7 +353,10 @@ class WhaleDetector:
         net_direction = self._determine_direction(net_volume, total_volume)
         
         # Calculate activity score
-        activity_score = min(total_volume / 50_000_000, 1.0)  # $50M = max
+        # FIX: Use asset-aware normalizer from config thresholds
+        # $50M is normal for BTC but rare for small caps
+        volume_normalizer = max(self.config.min_premium * 500, 10_000_000)  # Scale by threshold
+        activity_score = min(total_volume / volume_normalizer, 1.0)
         
         # Find notable strikes
         notable_strikes = self._find_notable_strikes(strike_activity)

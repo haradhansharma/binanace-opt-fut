@@ -75,6 +75,10 @@ class IVAnalyzer:
         """
         self.config = config or IVConfig()
         
+        # FIX: Rolling IV history for adaptive percentile calculation
+        self._iv_history = []
+        self._iv_history_max = 30  # Keep last 30 observations
+        
         logger.info(
             "IV analyzer initialized",
             extra={"data": {
@@ -210,10 +214,16 @@ class IVAnalyzer:
     
     def _estimate_iv_percentile(self, current_iv: float) -> float:
         """
-        Estimate IV percentile from current IV value.
+        Estimate IV percentile from current IV value using rolling window.
         
-        In production, this would use historical IV data.
-        This implementation uses rough thresholds for crypto.
+        FIX: Replaced static lookup table with rolling historical tracker.
+        Previously, the same IV value always mapped to the same percentile
+        regardless of market regime — e.g., 60% IV in a low-vol environment
+        (should be ~95th percentile) was mapped to 0.55 (55th percentile).
+        
+        The rolling window stores the last N IV observations and computes
+        the percentile as the fraction of observations below the current IV.
+        This makes the percentile adaptive to the current volatility regime.
         
         Args:
             current_iv: Current IV value
@@ -221,25 +231,32 @@ class IVAnalyzer:
         Returns:
             Estimated IV percentile (0-1)
         """
-        # Rough crypto IV ranges
-        # Very low: < 30%
-        # Low: 30-50%
-        # Normal: 50-70%
-        # High: 70-100%
-        # Very high: > 100%
+        # Store current IV in rolling history
+        self._iv_history.append(current_iv)
         
-        if current_iv <= 0.30:
-            return 0.15
-        elif current_iv <= 0.50:
-            return 0.35
-        elif current_iv <= 0.70:
-            return 0.55
-        elif current_iv <= 0.80:
-            return 0.70
-        elif current_iv <= 1.00:
-            return 0.85
-        else:
-            return 0.95
+        # Keep only the last N observations (default 30 data points ≈ 1 month of daily)
+        max_history = getattr(self, '_iv_history_max', 30)
+        if len(self._iv_history) > max_history:
+            self._iv_history = self._iv_history[-max_history:]
+        
+        # Need at least 5 observations for meaningful percentile
+        if len(self._iv_history) < 5:
+            # Not enough history yet — use a smooth interpolation as bootstrap
+            # This is better than a step-function lookup table
+            if current_iv <= 0.25:
+                return 0.10
+            elif current_iv >= 1.50:
+                return 0.95
+            else:
+                # Smooth interpolation between 0.25 (10th) and 1.50 (95th)
+                return 0.10 + (current_iv - 0.25) / (1.50 - 0.25) * 0.85
+        
+        # Calculate percentile: fraction of history below current IV
+        count_below = sum(1 for iv in self._iv_history if iv < current_iv)
+        percentile = count_below / len(self._iv_history)
+        
+        # Clamp to [0.05, 0.95] to avoid extreme percentiles from small samples
+        return max(0.05, min(percentile, 0.95))
     
     def _determine_iv_state(self, iv_percentile: float) -> str:
         """
@@ -312,10 +329,16 @@ class IVAnalyzer:
         is_extreme_high_iv = atm_iv >= 1.0 or iv_percentile >= 0.90  # 100%+ IV or 90th percentile
         is_extreme_low_iv = atm_iv <= 0.25 or iv_percentile <= 0.10  # 25% IV or 10th percentile
         
+        # FIX: Scale skew thresholds by ATM IV level
+        # A 5% skew at 30% IV (ATM) is very different from 5% skew at 100% IV
+        # Normalize: significant skew = 15% of ATM IV, moderate = 8%
+        skew_significant = atm_iv * 0.15  # e.g., at 60% IV → 0.09 (9%)
+        skew_moderate = atm_iv * 0.08     # e.g., at 60% IV → 0.048 (4.8%)
+        
         # High IV regime
         if is_high_iv:
             # IMPROVED: IV-004 - Distinguish between extreme and moderate IV
-            if iv_skew > 0.05:  # Significant positive skew (put demand)
+            if iv_skew > skew_significant:  # FIX: Scaled skew threshold
                 if is_extreme_high_iv:
                     # Extreme IV + positive skew = panic pricing → SHORT (follow momentum)
                     # High put demand confirms downside fear
@@ -325,7 +348,7 @@ class IVAnalyzer:
                     # Institutions hedging longs = contrarian LONG signal
                     # This is the key fix: don't always SHORT on positive skew
                     return SignalDirection.LONG, 0.45  # Contrarian signal
-            elif iv_skew > 0:
+            elif iv_skew > skew_moderate:  # FIX: Scaled moderate skew
                 if is_extreme_high_iv:
                     return SignalDirection.SHORT, 0.55
                 else:
@@ -337,7 +360,7 @@ class IVAnalyzer:
         
         # Low IV regime
         elif is_low_iv:
-            if iv_skew < -0.05:  # Significant negative skew (call demand)
+            if iv_skew < -skew_significant:  # FIX: Scaled negative skew
                 if is_extreme_low_iv:
                     # Extreme low IV + call demand = potential breakout → LONG
                     return SignalDirection.LONG, 0.65
@@ -345,7 +368,7 @@ class IVAnalyzer:
                     # Moderate low IV + call demand = could be crowded longs
                     # Contrarian: fade the call demand
                     return SignalDirection.SHORT, 0.35  # Contrarian signal
-            elif iv_skew < 0:
+            elif iv_skew < -skew_moderate:  # FIX: Scaled moderate negative skew
                 if is_extreme_low_iv:
                     return SignalDirection.LONG, 0.50
                 else:
@@ -362,10 +385,10 @@ class IVAnalyzer:
         else:
             # If IV is trending toward high/low, provide weak signals
             if atm_iv > (iv_high_value * 0.9):  # Approaching high
-                if iv_skew > 0.03:
+                if iv_skew > skew_moderate * 0.6:  # FIX: Scaled threshold
                     return SignalDirection.SHORT, 0.25
             elif atm_iv < (iv_low_value * 1.1):  # Approaching low
-                if iv_skew < -0.03:
+                if iv_skew < -skew_moderate * 0.6:  # FIX: Scaled threshold
                     return SignalDirection.LONG, 0.25
             
             return SignalDirection.NEUTRAL, 0.2

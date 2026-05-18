@@ -15,6 +15,7 @@ Max Pain Theory:
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
+import math
 
 from binance_signal_generator.models import (
     OptionsChain,
@@ -261,7 +262,9 @@ class MaxPainCalculator:
         """
         # Distance factor
         distance_pct = abs(spot_price - max_pain_strike) / spot_price
-        distance_factor = max(0, 1 - distance_pct * 10)  # 10% = 0 strength
+        # FIX: Scale distance factor to crypto ranges — BTC often trades 40%+ from max pain
+        # Use exponential decay: strength = e^(-3 * distance) instead of linear cutoff at 10%
+        distance_factor = math.exp(-3 * distance_pct)
         
         # Time factor
         if expiry:
@@ -273,7 +276,8 @@ class MaxPainCalculator:
             time_factor = 0.5
         
         # OI factor (normalize)
-        oi_factor = min(total_oi / 1_000_000, 1.0)  # 1M OI = max
+        # FIX: Use log scale for OI to handle BTC ($1B+ OI) vs small caps
+        oi_factor = min(math.log10(max(total_oi, 10)) / 7, 1.0)  # log10 scale: 10M → 0.71, 1B → 1.0
         
         # Combined strength
         strength = distance_factor * 0.4 + time_factor * 0.4 + oi_factor * 0.2

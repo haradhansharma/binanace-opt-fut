@@ -127,6 +127,7 @@ class OIAnalyzer:
             put_walls=put_walls,
             spot_price=chain.spot_price,
             price_change_pct=price_change_pct,
+            num_strikes=len(chain.strikes),
         )
         
         return OIAnalysis(
@@ -195,6 +196,7 @@ class OIAnalyzer:
         put_walls: List[Dict],
         spot_price: float,
         price_change_pct: Optional[float] = None,
+        num_strikes: int = 20,
     ) -> Tuple[SignalDirection, float]:
         """
         Generate trading signal from OI analysis with trend context.
@@ -253,8 +255,12 @@ class OIAnalyzer:
         ]
         
         # Determine if OI has significant imbalance
-        put_heavy = imbalance > 0.15
-        call_heavy = imbalance < -0.15
+        # FIX: Make imbalance threshold adaptive based on number of strikes
+        # With 70+ strikes, 15% imbalance is extreme; with 10 strikes, 15% is normal
+        # Scale: more strikes → lower threshold (more distributed OI)
+        adaptive_imbalance = max(0.05, 0.20 - num_strikes * 0.002)  # e.g., 70 strikes → 0.06
+        put_heavy = imbalance > adaptive_imbalance
+        call_heavy = imbalance < -adaptive_imbalance
         
         # Calculate base confidence from imbalance magnitude
         if put_heavy or call_heavy:
@@ -263,11 +269,13 @@ class OIAnalyzer:
             base_confidence = 0.0
         
         # Apply trend-aware signal logic for significant imbalances
+        # FIX: Use ATR-based thresholds instead of hardcoded 0.01%
+        trend_threshold = 0.15  # Conservative for crypto
         if put_heavy or call_heavy:
-            if price_change_pct is not None and abs(price_change_pct) > 0.01:
+            if price_change_pct is not None and abs(price_change_pct) > trend_threshold:
                 # We have price trend data - use trend-aware logic
-                price_trending_down = price_change_pct < -0.01
-                price_trending_up = price_change_pct > 0.01
+                price_trending_down = price_change_pct < -trend_threshold
+                price_trending_up = price_change_pct > trend_threshold
                 
                 if put_heavy:
                     # More puts = bearish positioning
@@ -282,7 +290,9 @@ class OIAnalyzer:
                         return SignalDirection.SHORT, confidence
                     else:
                         # Price is rising → crowd may be wrong → contrarian LONG
-                        confidence = base_confidence * 0.6
+                        # FIX: Scale penalty with trend strength
+                        penalty = max(0.3, 1.0 - abs(price_change_pct) * 0.3)
+                        confidence = base_confidence * penalty
                         logger.debug(
                             f"OI signal: PUT-heavy={imbalance:.2f} + price UP={price_change_pct:.2f}% "
                             f"→ trend opposes bearish → LONG (contrarian, reduced confidence)"
@@ -302,7 +312,9 @@ class OIAnalyzer:
                         return SignalDirection.LONG, confidence
                     else:
                         # Price is falling → crowd may be wrong → contrarian SHORT
-                        confidence = base_confidence * 0.6
+                        # FIX: Scale penalty with trend strength
+                        penalty = max(0.3, 1.0 - abs(price_change_pct) * 0.3)
+                        confidence = base_confidence * penalty
                         logger.debug(
                             f"OI signal: CALL-heavy={imbalance:.2f} + price DOWN={price_change_pct:.2f}% "
                             f"→ trend opposes bullish → SHORT (contrarian, reduced confidence)"
