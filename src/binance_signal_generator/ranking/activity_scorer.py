@@ -191,7 +191,12 @@ class ActivityScorer:
         """
         # Calculate metrics from chain
         total_oi = chain.total_call_oi + chain.total_put_oi
-        total_volume = chain.total_call_volume + chain.total_put_volume
+        # BUG FIX (Bug #14): Use notional (USDT) volume for total_options_volume,
+        # not contract count. After Bug #4 fix, total_call_volume/total_put_volume
+        # are contract counts. The scoring normalization uses total_volume_max
+        # ($10M by default) which is a USDT amount. Using contract count would
+        # make volume_total_norm ≈ 0 for all assets (5000 contracts / $10M = 0.0005).
+        total_volume_notional = chain.total_call_notional + chain.total_put_notional
         active_strikes = len([
             s for s in chain.strikes.values()
             if s.call.open_interest > 0 or s.put.open_interest > 0
@@ -213,7 +218,7 @@ class ActivityScorer:
             iv_percentile=iv_percentile,
             pcr_extremeness=pcr_extremeness,
             whale_activity=whale_activity,
-            total_options_volume=total_volume,
+            total_options_volume=total_volume_notional,  # BUG FIX (Bug #14): Use notional for scoring
             num_strikes_active=active_strikes,
         )
 

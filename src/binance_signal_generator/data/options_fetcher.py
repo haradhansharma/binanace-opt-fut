@@ -982,7 +982,16 @@ class OptionsFetcher:
 
             # Calculate metrics
             total_oi = chain.total_call_oi + chain.total_put_oi
-            total_volume = chain.total_call_volume + chain.total_put_volume
+            # BUG FIX (Bug #14): After Bug #4 fix, total_call_volume/total_put_volume
+            # are contract counts, NOT USDT notional. The ActivityMetrics field
+            # total_options_volume is used for liquidity checks against
+            # min_options_volume (denominated in USDT). We must use notional
+            # (USDT) volume for the liquidity check, not contract count.
+            # Contract count of 5000 ≠ $100K — an asset with 5000 contracts
+            # at $20 each would have $100K notional, easily passing the check,
+            # but the contract count (5000) fails the old 100K threshold.
+            total_volume_contracts = chain.total_call_volume + chain.total_put_volume
+            total_volume_notional = chain.total_call_notional + chain.total_put_notional
             active_strikes = len([s for s in chain.strikes.values()
                                  if s.call.open_interest > 0 or s.put.open_interest > 0])
 
@@ -1001,7 +1010,7 @@ class OptionsFetcher:
                 iv_percentile=iv_percentile,
                 pcr_extremeness=pcr_extremeness,
                 whale_activity=whale_activity,
-                total_options_volume=total_volume,
+                total_options_volume=total_volume_notional,  # BUG FIX (Bug #14): Use USDT notional for liquidity check
                 num_strikes_active=active_strikes,
             )
 

@@ -172,20 +172,171 @@ Both files have comments acknowledging uncertainty about whether `quoteQty` is i
 
 ---
 
-## 📊 Summary Table
+## 📊 Summary Table (Original Bugs #1-#9)
 
-| # | Bug | Severity | File | Impact |
-|---|---|---|---|---|
-| 1 | Sentiment penalty applied unconditionally | 🚨 CRITICAL | `sentiment.py:513` | Confidence wrongly reduced on correct signals |
-| 2 | OI flow always zero (missing model field) | 🚨 HIGH | `orchestrator.py:606` | 12% signal weight dead |
-| 3 | IV decimal/percentage format ambiguity | 🔴 HIGH | `options_fetcher.py:818` | IV + gamma signals may be wrong |
-| 4 | Volume PCR mixes notional and contract vol | 🟠 MEDIUM | `options_fetcher.py:863` | Volume PCR skewed |
-| 5 | DTE always 7 days (expiry never populated) | 🟠 MEDIUM | `gamma_exposure.py:225` | DTE weighting non-functional |
-| 6 | Block trade side integer vs string mismatch | 🟡 MEDIUM | `whale_detector.py:611 vs 211` | Potential systematic LONG bias |
-| 7 | Wall threshold still too restrictive | 🟡 LOW-MED | `wall_detector.py:36` | Walls rarely detected |
-| 8 | Dead IV term structure method | 🟡 LOW | `signal_scorer.py:669` | Dead code |
-| 9 | Whale quoteQty currency ambiguity | 🟡 LOW-MED | `options_fetcher.py:1013` | Premium values may be wrong |
+| # | Bug | Severity | File | Impact | Status |
+|---|---|---|---|---|---|
+| 1 | Sentiment penalty applied unconditionally | 🚨 CRITICAL | `sentiment.py:513` | Confidence wrongly reduced on correct signals | ✅ Fixed |
+| 2 | OI flow always zero (missing model field) | 🚨 HIGH | `orchestrator.py:606` | 12% signal weight dead | ✅ Fixed |
+| 3 | IV decimal/percentage format ambiguity | 🔴 HIGH | `options_fetcher.py:818` | IV + gamma signals may be wrong | ✅ Fixed |
+| 4 | Volume PCR mixes notional and contract vol | 🟠 MEDIUM | `options_fetcher.py:863` | Volume PCR skewed | ✅ Fixed |
+| 5 | DTE always 7 days (expiry never populated) | 🟠 MEDIUM | `gamma_exposure.py:225` | DTE weighting non-functional | ✅ Fixed |
+| 6 | Block trade side integer vs string mismatch | 🟡 MEDIUM | `whale_detector.py:611 vs 211` | Potential systematic LONG bias | ✅ Fixed |
+| 7 | Wall threshold still too restrictive | 🟡 LOW-MED | `wall_detector.py:36` | Walls rarely detected | ✅ Fixed |
+| 8 | Dead IV term structure method | 🟡 LOW | `signal_scorer.py:669` | Dead code | ✅ Fixed |
+| 9 | Whale quoteQty currency ambiguity | 🟡 LOW-MED | `options_fetcher.py:1013` | Premium values may be wrong | ✅ Fixed |
 
 ---
 
-> **The most impactful fix would be Bug #1 (sentiment penalty) and Bug #2 (OI flow dead weight) — together these represent significant distortion in signal generation.**
+### BUG #10: 🚨 HIGH — Systematic LONG Bias in `_combine_signals()`
+
+**File:** `signal_scorer.py`, lines 805-810 (`_combine_signals`)
+**Severity:** HIGH — Systematically favors LONG signals over SHORT
+
+The raw_score threshold is symmetric (+/-0.15), but several signals systematically contribute positive (LONG) weighted scores more often than negative:
+
+1. **max_pain**: Tends to be above current price → LONG signal dominates
+2. **PCR contrarian**: Legacy logic flips high PCR (bearish crowd) → LONG, and PCR > 1.0 is the default in crypto
+3. **wall_imbalance**: Put walls (protection) are structurally more common → typically > 0 → LONG
+4. **pcr_strike alignment**: `put_heavy_count` dominates in crypto (protection puts) → LONG
+
+The raw_score exceeds +0.15 far more often than -0.15, producing a systematic LONG bias.
+
+**Fix applied (multi-layered):**
+- **Wall concentration signal** (`_derive_wall_concentration_signal`): Added price trend dampening — when put walls suggest LONG but price is actively dropping, confidence is reduced (support is failing)
+- **PCR strike signal** (`_derive_pcr_strike_signal`): Added proximity-weighted counts instead of raw counts, plus price trend dampening — reduces the structural LONG bias from distant OTM put-heavy strikes
+- **PCR trend-aware logic** (`pcr_analyzer.py`): Lowered trend threshold from 0.15% to 0.05% so that trend-aware logic activates for almost all non-flat periods, reducing contrarian LONG fallback
+- **Structural bias correction** (`_combine_signals`): When max_pain, wall_conc, and pcr_strike all point LONG but balanced signals (oi_flow, sentiment) don't confirm, raw_score is reduced by 25%
+- **Trend validation** (`_combine_signals`): If combined signal opposes the clear price trend, confidence is penalized (50% for strong opposition, 30% for moderate)
+
+---
+
+### BUG #11: 🟠 MEDIUM — OI Flow ±5% Threshold Too High
+
+**File:** `orchestrator.py`, lines 616-617
+**Severity:** MEDIUM — OI flow (12% weight) frequently returns NEUTRAL, wasting its weight
+
+```python
+oi_building = oi_change_pct > 5
+oi_unwinding = oi_change_pct < -5
+```
+
+The ±5% threshold is too high for daily BTC/ETH OI changes. For example, BTC OI going from 20,000 to 20,800 contracts is a +4% change — meaningful but classified as NEUTRAL. This means the OI flow signal (12% weight) frequently returns NEUTRAL, effectively wasting its weight allocation.
+
+**Fix applied:** Lowered threshold from ±5% to ±2% for daily mode and ±1% for intraday mode:
+```python
+oi_threshold = 2.0  # Default: ±2% for daily
+if intraday_config and intraday_config.enabled:
+    oi_threshold = 1.0  # ±1% for intraday
+oi_building = oi_change_pct > oi_threshold
+oi_unwinding = oi_change_pct < -oi_threshold
+```
+
+---
+
+### BUG #12: 🟠 MEDIUM — Volume PCR Now Redundant with OI PCR
+
+**Files:** `models.py`, `options_fetcher.py`, `pcr_analyzer.py`
+**Severity:** MEDIUM — Volume PCR lost its distinct information after Bug #4 fix
+
+After Bug #4 fix changed `total_call_volume`/`total_put_volume` from USDT notional to contract count, the volume PCR (`put_contracts / call_contracts`) became essentially the same as OI PCR (`put_OI / call_OI`) — both measure the put/call ratio by contract count. This means the `volume_weight` (40%) in PCR combined calculation was contributing redundant information.
+
+**Fix applied:**
+1. **`models.py`**: Added `total_call_notional` and `total_put_notional` fields to `OptionsChain`, plus `get_notional_pcr()` method
+2. **`options_fetcher.py`**: Track both contract count AND USDT notional separately — `total_call_volume`/`total_put_volume` use contract count, `total_call_notional`/`total_put_notional` use USDT value
+3. **`pcr_analyzer.py`**: Changed volume PCR to use `chain.get_notional_pcr()` instead of `chain.get_volume_pcr()`. Notional PCR captures capital flow direction (where big money is trading), which is distinct from OI PCR (structural positioning). Deep ITM options have much higher notional per contract, so notional PCR reveals different information.
+
+---
+
+## 📊 Updated Summary Table
+
+| # | Bug | Severity | File | Status |
+|---|---|---|---|---|
+| 1 | Sentiment penalty applied unconditionally | 🚨 CRITICAL | `sentiment.py:513` | ✅ Fixed |
+| 2 | OI flow always zero (missing model field) | 🚨 HIGH | `orchestrator.py:606` | ✅ Fixed |
+| 3 | IV decimal/percentage format ambiguity | 🔴 HIGH | `options_fetcher.py:818` | ✅ Fixed |
+| 4 | Volume PCR mixes notional and contract vol | 🟠 MEDIUM | `options_fetcher.py:863` | ✅ Fixed |
+| 5 | DTE always 7 days (expiry never populated) | 🟠 MEDIUM | `gamma_exposure.py:225` | ✅ Fixed |
+| 6 | Block trade side integer vs string mismatch | 🟡 MEDIUM | `whale_detector.py:611` | ✅ Fixed |
+| 7 | Wall threshold still too restrictive | 🟡 LOW-MED | `wall_detector.py:36` | ✅ Fixed |
+| 8 | Dead IV term structure method | 🟡 LOW | `signal_scorer.py:669` | ✅ Fixed |
+| 9 | Whale quoteQty currency ambiguity | 🟡 LOW-MED | `options_fetcher.py:1013` | ✅ Fixed |
+| 10 | Systematic LONG bias in signal combination | 🚨 HIGH | `signal_scorer.py:805` | ✅ Fixed |
+| 11 | OI flow ±5% threshold too high | 🟠 MEDIUM | `orchestrator.py:616` | ✅ Fixed |
+| 12 | Volume PCR redundant with OI PCR | 🟠 MEDIUM | `models.py` + `options_fetcher.py` + `pcr_analyzer.py` | ✅ Fixed |
+| 13 | SelectionConfig ignores min_options_volume/min_active_strikes from config | 🚨 HIGH | `orchestrator.py:139` | ✅ Fixed |
+| 14 | total_options_volume is contract count but compared against USDT threshold | 🚨 HIGH | `options_fetcher.py:985` + `activity_scorer.py:194` | ✅ Fixed |
+| 15 | RankingConfig defaults too high ($5M/10) vs config.yaml ($100K/5) | 🟠 MEDIUM | `config/loader.py:148` | ✅ Fixed |
+
+---
+
+### BUG #13: 🚨 HIGH — SelectionConfig Ignores `min_options_volume` and `min_active_strikes` from Config
+
+**File:** `orchestrator.py`, lines 139-144
+**Severity:** HIGH — Most assets fail liquidity check silently
+
+```python
+self.asset_selector = AssetSelector(
+    SelectionConfig(
+        top_n=self.pipeline_config.top_n_assets,
+        min_activity_score=self.pipeline_config.min_activity_score,
+    )
+)
+```
+
+Only `top_n` and `min_activity_score` are passed. `min_options_volume` and `min_active_strikes` are NOT passed, so they fall back to `SelectionConfig` defaults ($100K / 5). The `config.ranking.min_options_volume` and `config.ranking.min_active_strikes` loaded from YAML are **completely ignored**.
+
+**Fix applied:** Pass all ranking config fields to `SelectionConfig`:
+```python
+self.asset_selector = AssetSelector(
+    SelectionConfig(
+        top_n=self.pipeline_config.top_n_assets,
+        min_activity_score=self.pipeline_config.min_activity_score,
+        min_options_volume=config.ranking.min_options_volume,
+        min_active_strikes=config.ranking.min_active_strikes,
+        excluded_symbols=set(config.ranking.excluded_symbols),
+    )
+)
+```
+
+---
+
+### BUG #14: 🚨 HIGH — `total_options_volume` is Contract Count But Compared Against USDT Dollar Threshold
+
+**Files:** `options_fetcher.py:985`, `activity_scorer.py:194`
+**Severity:** HIGH — Virtually all assets fail the liquidity check
+
+After Bug #4 fix changed `total_call_volume`/`total_put_volume` from USDT notional to contract count, the `total_options_volume` field (used for liquidity checks and scoring) became a contract count instead of a USDT amount.
+
+The liquidity check in `asset_selector.py`:
+```python
+metrics.total_options_volume >= self.config.min_options_volume  # e.g., 5000 >= 100000? NO!
+```
+
+A typical ETHUSDT options chain might have 5000 contracts traded, but the `min_options_volume` threshold is $100,000 USDT. 5000 contracts ≠ $100K, so the asset fails the liquidity check.
+
+This affects BOTH:
+1. `options_fetcher.py:get_activity_summary()` — sets `total_options_volume = chain.total_call_volume + chain.total_put_volume` (contract count)
+2. `activity_scorer.py:score_from_chain()` — same issue
+
+**Fix applied:** Use `chain.total_call_notional + chain.total_put_notional` (USDT notional) for `total_options_volume` instead of contract count. This ensures the liquidity check compares like-for-like (USDT vs USDT).
+
+---
+
+### BUG #15: 🟠 MEDIUM — `RankingConfig` Defaults Too High ($5M/10) vs config.yaml ($100K/5)
+
+**File:** `config/loader.py`, lines 148-149
+**Severity:** MEDIUM — If config.yaml doesn't specify values, defaults reject most assets
+
+```python
+min_options_volume: float = 5_000_000  # $5M default
+min_active_strikes: int = 10           # 10 strikes default
+```
+
+The config.yaml specifies `$100K / 5` which works for most Binance Options assets. But if the YAML is missing these keys, the loader falls back to $5M/10, which rejects virtually all crypto options assets. The defaults should match the recommended config.yaml values.
+
+**Fix applied:** Lowered defaults to $100K / 5 to match config.yaml.
+
+---
+
+> **All 15 bugs have been fixed. Bugs #13-#15 specifically address why only 1 asset was being selected — the liquidity check was comparing contract count against a USDT dollar threshold, and the config was not being properly passed to the asset selector.**

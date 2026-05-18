@@ -145,8 +145,13 @@ class RankingConfig:
     total_volume_max: float = 100_000_000
     
     # Liquidity requirements
-    min_options_volume: float = 5_000_000
-    min_active_strikes: int = 10
+    # BUG FIX (Bug #15): Lowered defaults to match config.yaml recommendations.
+    # Previously, defaults were $5M / 10 strikes, which rejected most Binance
+    # Options assets. Most crypto options have volume well below $5M and fewer
+    # than 10 active strikes. The $100K / 5 strike threshold allows more assets
+    # through while still filtering out completely illiquid ones.
+    min_options_volume: float = 100_000  # $100K minimum (lowered from $5M)
+    min_active_strikes: int = 5  # Lowered from 10
     
     # Exclusions
     excluded_symbols: list = field(default_factory=list)
@@ -452,8 +457,8 @@ class Config:
             oi_change_max_pct=thresholds.get("oi_change_max_pct", 20.0),
             volume_spike_max=thresholds.get("volume_spike_max", 5.0),
             total_volume_max=thresholds.get("total_volume_max", 100_000_000),
-            min_options_volume=data.get("min_options_volume", 5_000_000),
-            min_active_strikes=data.get("min_active_strikes", 10),
+            min_options_volume=data.get("min_options_volume", 100_000),  # BUG FIX (Bug #15): Lowered default from $5M
+            min_active_strikes=data.get("min_active_strikes", 5),  # BUG FIX (Bug #15): Lowered default from 10
             excluded_symbols=data.get("excluded_symbols", []),
         )
     

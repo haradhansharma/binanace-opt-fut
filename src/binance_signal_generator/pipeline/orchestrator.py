@@ -136,10 +136,20 @@ class PipelineOrchestrator:
         
         # Initialize analysis modules
         self.activity_scorer = ActivityScorer()
+        # BUG FIX (Bug #13): Pass min_options_volume and min_active_strikes
+        # from config.ranking instead of relying on SelectionConfig defaults.
+        # Previously, only top_n and min_activity_score were passed, leaving
+        # min_options_volume and min_active_strikes at their default values
+        # (100K / 5). The config.yaml may specify different values (e.g., 100K / 5)
+        # but the RankingConfig loader defaults were $5M / 10, which would
+        # reject most crypto options assets.
         self.asset_selector = AssetSelector(
             SelectionConfig(
                 top_n=self.pipeline_config.top_n_assets,
                 min_activity_score=self.pipeline_config.min_activity_score,
+                min_options_volume=config.ranking.min_options_volume,
+                min_active_strikes=config.ranking.min_active_strikes,
+                excluded_symbols=set(config.ranking.excluded_symbols),
             )
         )
         self.signal_scorer = SignalScorer()
