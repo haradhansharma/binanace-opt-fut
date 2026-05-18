@@ -11,6 +11,17 @@ The sentiment analyzer can be used as:
 - Part of the signal scoring system
 - A contrarian indicator when sentiment reaches extremes
 
+BUG FIX (Bug #5): Added trend-aware logic. Previously, contrarian mode only
+activated at extreme L/S ratios (> 3.0), which rarely occur in downtrends.
+In a downtrend, L/S ratios tend to be moderate (0.8-1.2), so contrarian
+bearish signals almost never fired, while the "following mode" easily
+produced LONG signals (combined_score > 0.15). Now, when price_change_pct
+is provided, the signal respects the prevailing price trend:
+- Bullish sentiment + price dropping → contrarian SHORT (reduced confidence)
+- Bearish sentiment + price rising → contrarian LONG (reduced confidence)
+- Sentiment aligned with trend → follow trend (boosted confidence)
+- No trend data → legacy behavior unchanged
+
 Rate Limits:
 - Top Trader L/S Ratios: FREE (weight 0)
 - Funding Rate History: weight 5 per call
@@ -114,6 +125,7 @@ class SentimentAnalyzer:
         top_trader_position_data: List[LSRatioData],
         top_trader_account_data: List[LSRatioData],
         funding_rate_data: List[FundingRateData],
+        price_change_pct: Optional[float] = None,
     ) -> SentimentAnalysis:
         """
         Perform complete sentiment analysis.
@@ -123,6 +135,10 @@ class SentimentAnalyzer:
             top_trader_position_data: Top trader position ratio history
             top_trader_account_data: Top trader account ratio history
             funding_rate_data: Funding rate history
+            price_change_pct: Optional price change percentage for trend-aware
+                signal generation. Positive = price rising, Negative = price falling.
+                When provided, enables trend-aware logic that prevents sentiment
+                from generating counter-trend signals with full confidence.
             
         Returns:
             SentimentAnalysis with combined sentiment
@@ -170,6 +186,7 @@ class SentimentAnalyzer:
             combined_sentiment = "NEUTRAL"
         
         # Determine signal
+        # BUG FIX (Bug #5): Pass price_change_pct to enable trend-aware logic
         signal, signal_confidence, is_contrarian = self._determine_signal(
             position_score=position_score,
             account_score=account_score,
@@ -178,6 +195,7 @@ class SentimentAnalyzer:
             position_ratio=position_ratio,
             account_ratio=account_ratio,
             funding_extreme=funding_extreme,
+            price_change_pct=price_change_pct,
         )
         
         # Calculate overall confidence
@@ -391,22 +409,42 @@ class SentimentAnalyzer:
         position_ratio: float,
         account_ratio: float,
         funding_extreme: bool,
+        price_change_pct: Optional[float] = None,
     ) -> tuple:
         """
         Determine the trading signal from sentiment.
         
-        Signal Logic:
+        Signal Logic (BUG FIX for Bug #5 - trend-aware):
         1. Following mode: Trade with top trader positioning
         2. Contrarian mode: Fade extreme positioning
         3. Funding extremes: Contrarian signal
+        4. TREND-AWARE: When price_change_pct is available:
+           - If sentiment is bullish but price is dropping → SHORT (contrarian, reduced confidence)
+           - If sentiment is bearish but price is rising → LONG (contrarian, reduced confidence)
+           - If sentiment aligns with price trend → follow trend (boosted confidence)
+           
+        Without price_change_pct, the original behavior is preserved.
         
         Args:
-            All sentiment component scores
+            position_score: Position ratio sentiment score (-1 to 1)
+            account_score: Account ratio sentiment score (-1 to 1)
+            funding_score: Funding rate sentiment score (-1 to 1)
+            combined_score: Weighted combined sentiment score
+            position_ratio: Latest top trader position L/S ratio
+            account_ratio: Latest top trader account L/S ratio
+            funding_extreme: Whether funding rate is at extreme level
+            price_change_pct: Optional price change % for trend context.
+                Positive = price rising, Negative = price falling.
             
         Returns:
             Tuple of (SignalDirection, confidence, is_contrarian)
         """
         is_contrarian = False
+        
+        # Determine price trend for trend-aware logic
+        price_dropping = price_change_pct is not None and price_change_pct < -0.1
+        price_rising = price_change_pct is not None and price_change_pct > 0.1
+        has_trend = price_change_pct is not None
         
         # Check for extreme positioning (contrarian signal)
         if self.config.use_contrarian_signals:
@@ -415,14 +453,48 @@ class SentimentAnalyzer:
                 signal = SignalDirection.SHORT
                 is_contrarian = True
                 confidence = min((position_ratio - 1.0) / self.config.contrarian_extreme_threshold, 0.8)
-                return signal, confidence, is_contrarian
+                
+                # BUG FIX: Trend-aware adjustment for extreme contrarian signals
+                # If price is dropping and contrarian says SHORT → trend confirms → boost
+                if has_trend and price_dropping and signal == SignalDirection.SHORT:
+                    confidence = min(confidence * 1.2, 0.85)
+                    logger.debug(
+                        f"Sentiment: Extreme long positioning contrarian SHORT confirmed by "
+                        f"price dropping ({price_change_pct:.2f}%) → boosted confidence"
+                    )
+                # If price is rising and contrarian says SHORT → trend opposes → reduce
+                elif has_trend and price_rising and signal == SignalDirection.SHORT:
+                    confidence *= 0.6
+                    logger.debug(
+                        f"Sentiment: Extreme long positioning contrarian SHORT opposed by "
+                        f"price rising ({price_change_pct:.2f}%) → reduced confidence"
+                    )
+                
+                return signal, round(confidence, 3), is_contrarian
             
             # Extreme short positioning -> contrarian long
             if position_ratio < 1.0 / self.config.contrarian_extreme_threshold:
                 signal = SignalDirection.LONG
                 is_contrarian = True
                 confidence = min((1.0 / position_ratio - 1.0) / self.config.contrarian_extreme_threshold, 0.8)
-                return signal, confidence, is_contrarian
+                
+                # BUG FIX: Trend-aware adjustment
+                # If price is rising and contrarian says LONG → trend confirms → boost
+                if has_trend and price_rising and signal == SignalDirection.LONG:
+                    confidence = min(confidence * 1.2, 0.85)
+                    logger.debug(
+                        f"Sentiment: Extreme short positioning contrarian LONG confirmed by "
+                        f"price rising ({price_change_pct:.2f}%) → boosted confidence"
+                    )
+                # If price is dropping and contrarian says LONG → trend opposes → reduce
+                elif has_trend and price_dropping and signal == SignalDirection.LONG:
+                    confidence *= 0.6
+                    logger.debug(
+                        f"Sentiment: Extreme short positioning contrarian LONG opposed by "
+                        f"price dropping ({price_change_pct:.2f}%) → reduced confidence"
+                    )
+                
+                return signal, round(confidence, 3), is_contrarian
             
             # Funding extreme -> contrarian
             if funding_extreme:
@@ -431,23 +503,122 @@ class SentimentAnalyzer:
                     signal = SignalDirection.SHORT
                     is_contrarian = True
                     confidence = 0.6
-                    return signal, confidence, is_contrarian
+                    
+                    # Trend-aware: dropping confirms SHORT from crowded longs
+                    if has_trend and price_dropping:
+                        confidence = min(confidence * 1.2, 0.85)
+                        logger.debug(
+                            f"Sentiment: Funding extreme contrarian SHORT confirmed by "
+                            f"price dropping ({price_change_pct:.2f}%)"
+                        )
+                    elif has_trend and price_rising:
+                        confidence *= 0.6
+                        logger.debug(
+                            f"Sentiment: Funding extreme contrarian SHORT opposed by "
+                            f"price rising ({price_change_pct:.2f}%)"
+                        )
+                    
+                    return signal, round(confidence, 3), is_contrarian
                 else:
                     signal = SignalDirection.LONG
                     is_contrarian = True
                     confidence = 0.6
-                    return signal, confidence, is_contrarian
+                    
+                    # Trend-aware: rising confirms LONG from crowded shorts
+                    if has_trend and price_rising:
+                        confidence = min(confidence * 1.2, 0.85)
+                        logger.debug(
+                            f"Sentiment: Funding extreme contrarian LONG confirmed by "
+                            f"price rising ({price_change_pct:.2f}%)"
+                        )
+                    elif has_trend and price_dropping:
+                        confidence *= 0.6
+                        logger.debug(
+                            f"Sentiment: Funding extreme contrarian LONG opposed by "
+                            f"price dropping ({price_change_pct:.2f}%)"
+                        )
+                    
+                    return signal, round(confidence, 3), is_contrarian
         
-        # Normal following mode
+        # BUG FIX (Bug #5): Trend-aware following mode
+        # Previously, the following mode simply used combined_score thresholds:
+        #   > 0.15 → LONG, < -0.15 → SHORT
+        # Problem: In a downtrend, combined_score can be slightly positive (0.15-0.3)
+        # because L/S ratios are moderate (not extreme enough for contrarian), but the
+        # slight bullish bias still produces a LONG signal. This is wrong when price is
+        # actively dropping — the market is bearish and sentiment should follow the trend.
+        # 
+        # New logic: When price trend is available and the trend opposes the sentiment
+        # direction, we flip the signal and reduce confidence (trend takes priority).
+        # When trend aligns with sentiment, we boost confidence.
+        
         if combined_score > 0.15:
-            signal = SignalDirection.LONG
-            confidence = min(abs(combined_score), 0.8)
+            # Bullish sentiment from positioning
+            if has_trend and price_dropping:
+                # BUG FIX: Sentiment says bullish but price is dropping
+                # → Trend overrides: generate SHORT signal (contrarian to sentiment)
+                signal = SignalDirection.SHORT
+                is_contrarian = True
+                # Confidence based on how much the trend opposes sentiment
+                trend_strength = min(abs(price_change_pct) / 2.0, 0.5)
+                confidence = min(trend_strength, abs(combined_score) * 0.6)
+                logger.debug(
+                    f"Sentiment: Bullish sentiment (score={combined_score:.2f}) but price DROPPING "
+                    f"({price_change_pct:.2f}%) → trend override → SHORT (confidence={confidence:.2f})"
+                )
+            else:
+                signal = SignalDirection.LONG
+                confidence = min(abs(combined_score), 0.8)
+                # Boost if price trend confirms
+                if has_trend and price_rising:
+                    confidence = min(confidence * 1.15, 0.85)
+                    logger.debug(
+                        f"Sentiment: Bullish sentiment confirmed by price rising ({price_change_pct:.2f}%)"
+                    )
+        
         elif combined_score < -0.15:
-            signal = SignalDirection.SHORT
-            confidence = min(abs(combined_score), 0.8)
+            # Bearish sentiment from positioning
+            if has_trend and price_rising:
+                # BUG FIX: Sentiment says bearish but price is rising
+                # → Trend overrides: generate LONG signal (contrarian to sentiment)
+                signal = SignalDirection.LONG
+                is_contrarian = True
+                trend_strength = min(abs(price_change_pct) / 2.0, 0.5)
+                confidence = min(trend_strength, abs(combined_score) * 0.6)
+                logger.debug(
+                    f"Sentiment: Bearish sentiment (score={combined_score:.2f}) but price RISING "
+                    f"({price_change_pct:.2f}%) → trend override → LONG (confidence={confidence:.2f})"
+                )
+            else:
+                signal = SignalDirection.SHORT
+                confidence = min(abs(combined_score), 0.8)
+                # Boost if price trend confirms
+                if has_trend and price_dropping:
+                    confidence = min(confidence * 1.15, 0.85)
+                    logger.debug(
+                        f"Sentiment: Bearish sentiment confirmed by price dropping ({price_change_pct:.2f}%)"
+                    )
+        
         else:
-            signal = SignalDirection.NEUTRAL
-            confidence = 0.0
+            # Neutral zone (combined_score between -0.15 and 0.15)
+            # But if price has a clear trend, generate a signal in that direction
+            if has_trend and price_dropping:
+                signal = SignalDirection.SHORT
+                confidence = min(abs(price_change_pct) / 4.0, 0.4)
+                logger.debug(
+                    f"Sentiment: Neutral zone but price DROPPING ({price_change_pct:.2f}%) "
+                    f"→ following trend → SHORT"
+                )
+            elif has_trend and price_rising:
+                signal = SignalDirection.LONG
+                confidence = min(abs(price_change_pct) / 4.0, 0.4)
+                logger.debug(
+                    f"Sentiment: Neutral zone but price RISING ({price_change_pct:.2f}%) "
+                    f"→ following trend → LONG"
+                )
+            else:
+                signal = SignalDirection.NEUTRAL
+                confidence = 0.0
         
         return signal, round(confidence, 3), is_contrarian
     

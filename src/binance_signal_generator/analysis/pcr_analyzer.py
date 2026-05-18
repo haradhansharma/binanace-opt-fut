@@ -6,13 +6,16 @@ trading signals. PCR is a sentiment indicator that shows the balance
 between put and call options.
 
 PCR Interpretation:
-- PCR > 1.2: Put-heavy, potentially bearish sentiment (contrarian: bullish)
-- PCR < 0.8: Call-heavy, potentially bullish sentiment (contrarian: bearish)
+- PCR > 1.2: Put-heavy, potentially bearish sentiment
+- PCR < 0.8: Call-heavy, potentially bullish sentiment
 - PCR around 1.0: Balanced market
 
-Signal Logic (Contrarian):
-- High PCR (> 1.2): Market is bearish, contrarian bullish signal
-- Low PCR (< 0.8): Market is bullish, contrarian bearish signal
+Signal Logic (Trend-Aware):
+- High PCR + price falling: Trend confirms bearish → SHORT (follow trend)
+- High PCR + price rising: Trend opposes → LONG (contrarian, reduced confidence)
+- Low PCR + price rising: Trend confirms bullish → LONG (follow trend)
+- Low PCR + price falling: Trend opposes → SHORT (contrarian, reduced confidence)
+- Without price trend data: Falls back to contrarian logic (legacy)
 """
 
 from datetime import datetime
@@ -55,12 +58,14 @@ class PCRAnalyzer:
     2. Volume-based PCR: Total Put Volume / Total Call Volume
     3. Weighted PCR: Combination of both
     
-    Signal Generation (Contrarian):
-    - High PCR = Bearish sentiment = Bullish contrarian signal
-    - Low PCR = Bullish sentiment = Bearish contrarian signal
+    Signal Generation (Trend-Aware):
+    - When price trend CONFIRMS PCR: Follow the trend (crowd is right)
+    - When price trend OPPOSES PCR: Contrarian signal with reduced confidence
+    - Without price data: Falls back to pure contrarian logic
     
-    Note: This is a contrarian indicator - when the crowd is
-    positioned one way, the market often moves the opposite.
+    The trend-aware approach prevents the systematic LONG bias that occurred
+    when contrarian logic always flipped bearish PCR signals to LONG, even
+    when the market was actively trending down.
     
     Attributes:
         config: PCR analysis configuration
@@ -83,12 +88,20 @@ class PCRAnalyzer:
             }}
         )
     
-    def analyze(self, chain: OptionsChain) -> PCRAnalysis:
+    def analyze(
+        self,
+        chain: OptionsChain,
+        price_change_pct: Optional[float] = None,
+    ) -> PCRAnalysis:
         """
         Analyze PCR from options chain.
         
         Args:
             chain: Options chain data
+            price_change_pct: Optional price change percentage for trend context.
+                When provided, the signal logic adjusts between contrarian and
+                trend-following based on whether price trend confirms or opposes
+                the PCR signal direction.
             
         Returns:
             PCRAnalysis with PCR metrics and signal
@@ -111,8 +124,8 @@ class PCRAnalyzer:
         # Determine PCR state
         pcr_state = self._determine_pcr_state(pcr_combined)
         
-        # Generate signal
-        signal, confidence = self._generate_signal(pcr_combined)
+        # Generate signal with trend context
+        signal, confidence = self._generate_signal(pcr_combined, price_change_pct)
         
         return PCRAnalysis(
             symbol=chain.underlying,
@@ -168,48 +181,131 @@ class PCRAnalyzer:
         else:
             return "NEUTRAL"
     
-    def _generate_signal(self, pcr: float) -> tuple:
+    def _generate_signal(
+        self,
+        pcr: float,
+        price_change_pct: Optional[float] = None,
+    ) -> tuple:
         """
-        Generate trading signal from PCR.
+        Generate trading signal from PCR with trend context.
         
-        Contrarian Logic:
-        - High PCR (> 1.2): Crowd is bearish -> Bullish signal
-        - Low PCR (< 0.8): Crowd is bullish -> Bearish signal
-        - Extreme values get higher confidence
+        Signal Logic (Trend-Aware):
+        
+        PCR alone is traditionally a contrarian indicator:
+        - High PCR (> 1.2): Crowd is bearish -> Contrarian bullish signal
+        - Low PCR (< 0.8): Crowd is bullish -> Contrarian bearish signal
+        
+        BUG FIX: When price trend CONFIRMS the PCR reading (e.g., high PCR
+        + price falling), the crowd is RIGHT and contrarian logic is wrong.
+        In a trending market, contrarian signals should be suppressed and
+        replaced with trend-following signals.
+        
+        Decision matrix:
+        ┌─────────────┬───────────────┬─────────────────────────────────┐
+        │ PCR Signal  │ Price Trend   │ Action                          │
+        ├─────────────┼───────────────┼─────────────────────────────────┤
+        │ High (bear) │ Price DOWN    │ Trend confirms → SHORT (follow) │
+        │ High (bear) │ Price UP      │ Trend opposes → LONG (contrarian)│
+        │ High (bear) │ No trend data → LONG (contrarian, legacy)    │
+        │ Low (bull)  │ Price UP      │ Trend confirms → LONG (follow)  │
+        │ Low (bull)  │ Price DOWN    │ Trend opposes → SHORT (contrarian)│
+        │ Low (bull)  │ No trend data → SHORT (contrarian, legacy)   │
+        └─────────────┴───────────────┴─────────────────────────────────┘
+        
+        Confidence adjustment:
+        - Trend-following: confidence based on PCR extremity + trend strength
+        - Contrarian (trend opposes): confidence reduced by 40% since the
+          market is actively moving against the contrarian view
+        - No trend data: uses legacy contrarian logic (unchanged)
         
         Args:
             pcr: Combined PCR value
+            price_change_pct: Price change percentage for trend context.
+                Positive = price rising, Negative = price falling.
             
         Returns:
             Tuple of (SignalDirection, confidence)
         """
-        # Very high PCR (extreme bearishness) - Strong bullish contrarian
-        if pcr >= self.config.pcr_extreme_high:
-            return SignalDirection.LONG, 0.8
+        # Determine the raw PCR direction (before contrarian/trend-following)
+        pcr_bearish = pcr >= self.config.pcr_high_threshold  # High PCR = bearish sentiment
+        pcr_bullish = pcr <= self.config.pcr_low_threshold   # Low PCR = bullish sentiment
         
-        # High PCR (bearish sentiment) - Bullish contrarian
+        # Calculate base confidence from PCR extremity
+        if pcr >= self.config.pcr_extreme_high:
+            base_confidence = 0.8
         elif pcr >= self.config.pcr_high_threshold:
-            # Scale confidence based on how extreme
             excess = (pcr - self.config.pcr_high_threshold) / (
                 self.config.pcr_extreme_high - self.config.pcr_high_threshold
             )
-            confidence = 0.5 + 0.3 * min(excess, 1.0)
-            return SignalDirection.LONG, confidence
-        
-        # Very low PCR (extreme bullishness) - Strong bearish contrarian
+            base_confidence = 0.5 + 0.3 * min(excess, 1.0)
         elif pcr <= self.config.pcr_extreme_low:
-            return SignalDirection.SHORT, 0.8
-        
-        # Low PCR (bullish sentiment) - Bearish contrarian
+            base_confidence = 0.8
         elif pcr <= self.config.pcr_low_threshold:
-            # Scale confidence based on how extreme
             deficit = (self.config.pcr_low_threshold - pcr) / (
                 self.config.pcr_low_threshold - self.config.pcr_extreme_low
             )
-            confidence = 0.5 + 0.3 * min(deficit, 1.0)
-            return SignalDirection.SHORT, confidence
+            base_confidence = 0.5 + 0.3 * min(deficit, 1.0)
+        else:
+            return SignalDirection.NEUTRAL, 0.2
         
-        # Neutral PCR
+        # Apply trend-aware signal logic
+        if price_change_pct is not None and abs(price_change_pct) > 0.01:
+            # We have price trend data - use trend-aware logic
+            price_trending_down = price_change_pct < -0.01
+            price_trending_up = price_change_pct > 0.01
+            
+            if pcr_bearish:
+                # High PCR = crowd is bearish
+                if price_trending_down:
+                    # Price IS falling → crowd is RIGHT → trend-following SHORT
+                    # Stronger confidence when trend confirms PCR
+                    trend_strength = min(abs(price_change_pct) / 3.0, 0.3)
+                    confidence = min(base_confidence + trend_strength, 0.85)
+                    logger.debug(
+                        f"PCR signal: HIGH={pcr:.2f} + price DOWN={price_change_pct:.2f}% "
+                        f"→ trend confirms bearish → SHORT (follow trend)"
+                    )
+                    return SignalDirection.SHORT, confidence
+                else:
+                    # Price is rising → crowd may be wrong → contrarian LONG
+                    # Reduce confidence since market is moving against contrarian view
+                    confidence = base_confidence * 0.6
+                    logger.debug(
+                        f"PCR signal: HIGH={pcr:.2f} + price UP={price_change_pct:.2f}% "
+                        f"→ trend opposes bearish → LONG (contrarian, reduced confidence)"
+                    )
+                    return SignalDirection.LONG, confidence
+            
+            elif pcr_bullish:
+                # Low PCR = crowd is bullish
+                if price_trending_up:
+                    # Price IS rising → crowd is RIGHT → trend-following LONG
+                    trend_strength = min(abs(price_change_pct) / 3.0, 0.3)
+                    confidence = min(base_confidence + trend_strength, 0.85)
+                    logger.debug(
+                        f"PCR signal: LOW={pcr:.2f} + price UP={price_change_pct:.2f}% "
+                        f"→ trend confirms bullish → LONG (follow trend)"
+                    )
+                    return SignalDirection.LONG, confidence
+                else:
+                    # Price is falling → crowd may be wrong → contrarian SHORT
+                    # Reduce confidence since market is moving against contrarian view
+                    confidence = base_confidence * 0.6
+                    logger.debug(
+                        f"PCR signal: LOW={pcr:.2f} + price DOWN={price_change_pct:.2f}% "
+                        f"→ trend opposes bullish → SHORT (contrarian, reduced confidence)"
+                    )
+                    return SignalDirection.SHORT, confidence
+        
+        # No trend data available → use legacy contrarian logic
+        if pcr >= self.config.pcr_extreme_high:
+            return SignalDirection.LONG, base_confidence
+        elif pcr >= self.config.pcr_high_threshold:
+            return SignalDirection.LONG, base_confidence
+        elif pcr <= self.config.pcr_extreme_low:
+            return SignalDirection.SHORT, base_confidence
+        elif pcr <= self.config.pcr_low_threshold:
+            return SignalDirection.SHORT, base_confidence
         else:
             return SignalDirection.NEUTRAL, 0.2
     
@@ -306,13 +402,13 @@ class PCRAnalyzer:
     def _interpret_pcr(self, pcr: float) -> str:
         """Interpret PCR value."""
         if pcr >= self.config.pcr_extreme_high:
-            return "Extreme put bias - very bearish crowd - contrarian bullish"
+            return "Extreme put bias - very bearish crowd - trend-aware: follow if price falling, contrarian if rising"
         elif pcr >= self.config.pcr_high_threshold:
-            return "High put bias - bearish crowd - contrarian bullish"
+            return "High put bias - bearish crowd - trend-aware: follow if price falling, contrarian if rising"
         elif pcr <= self.config.pcr_extreme_low:
-            return "Extreme call bias - very bullish crowd - contrarian bearish"
+            return "Extreme call bias - very bullish crowd - trend-aware: follow if price rising, contrarian if falling"
         elif pcr <= self.config.pcr_low_threshold:
-            return "High call bias - bullish crowd - contrarian bearish"
+            return "High call bias - bullish crowd - trend-aware: follow if price rising, contrarian if falling"
         else:
             return "Balanced market - neutral"
     

@@ -8,6 +8,13 @@ OI Analysis:
 - OI concentration at strikes = Price magnets
 - OI changes = New positions being opened/closed
 - Call vs Put OI imbalance = Directional bias
+
+Signal Logic (Trend-Aware):
+- Put OI dominance + price falling: Trend confirms bearish → SHORT (follow trend)
+- Put OI dominance + price rising: Trend opposes → LONG (contrarian, reduced confidence)
+- Call OI dominance + price rising: Trend confirms bullish → LONG (follow trend)
+- Call OI dominance + price falling: Trend opposes → SHORT (contrarian, reduced confidence)
+- Without price trend data: Falls back to contrarian logic (legacy)
 """
 
 from datetime import datetime
@@ -52,10 +59,14 @@ class OIAnalyzer:
     3. Call/Put OI: Directional bias
     4. OI Changes: Position flow (requires historical data)
     
-    Signal Generation:
-    - High Call OI concentration above spot = Resistance
-    - High Put OI concentration below spot = Support
-    - OI buildup = Strengthening positions
+    Signal Generation (Trend-Aware):
+    - When price trend CONFIRMS OI imbalance: Follow the trend (crowd is right)
+    - When price trend OPPOSES OI imbalance: Contrarian signal with reduced confidence
+    - Without price data: Falls back to pure contrarian logic
+    
+    The trend-aware approach prevents the systematic LONG bias that occurred
+    when contrarian logic always flipped put-heavy OI to LONG, even when
+    the market was actively trending down.
     
     Attributes:
         config: OI analysis configuration
@@ -77,12 +88,20 @@ class OIAnalyzer:
             }}
         )
     
-    def analyze(self, chain: OptionsChain) -> OIAnalysis:
+    def analyze(
+        self,
+        chain: OptionsChain,
+        price_change_pct: Optional[float] = None,
+    ) -> OIAnalysis:
         """
         Analyze OI from options chain.
         
         Args:
             chain: Options chain data
+            price_change_pct: Optional price change percentage for trend context.
+                When provided, the signal logic adjusts between contrarian and
+                trend-following based on whether price trend confirms or opposes
+                the OI imbalance direction.
             
         Returns:
             OIAnalysis with OI metrics and signal
@@ -100,13 +119,14 @@ class OIAnalyzer:
         # Find OI walls
         call_walls, put_walls = self._find_oi_walls(chain)
         
-        # Generate signal
+        # Generate signal with trend context
         signal, confidence = self._generate_signal(
             call_concentration=call_concentration,
             put_concentration=put_concentration,
             call_walls=call_walls,
             put_walls=put_walls,
             spot_price=chain.spot_price,
+            price_change_pct=price_change_pct,
         )
         
         return OIAnalysis(
@@ -174,14 +194,38 @@ class OIAnalyzer:
         call_walls: List[Dict],
         put_walls: List[Dict],
         spot_price: float,
+        price_change_pct: Optional[float] = None,
     ) -> Tuple[SignalDirection, float]:
         """
-        Generate trading signal from OI analysis.
+        Generate trading signal from OI analysis with trend context.
         
-        Signal Logic:
-        - More put OI = Bearish positioning = Contrarian bullish
-        - More call OI = Bullish positioning = Contrarian bearish
-        - Walls near spot = Price magnet effect
+        Signal Logic (Trend-Aware):
+        
+        OI imbalance alone is traditionally a contrarian indicator:
+        - More put OI (imbalance > 0.15): Bearish positioning → Contrarian LONG
+        - More call OI (imbalance < -0.15): Bullish positioning → Contrarian SHORT
+        
+        BUG FIX: When price trend CONFIRMS the OI imbalance (e.g., put-heavy
+        + price falling), the crowd is RIGHT and contrarian logic is wrong.
+        In a trending market, contrarian signals should be suppressed and
+        replaced with trend-following signals.
+        
+        Decision matrix:
+        ┌───────────────────┬───────────────┬──────────────────────────────────┐
+        │ OI Imbalance      │ Price Trend   │ Action                           │
+        ├───────────────────┼───────────────┼──────────────────────────────────┤
+        │ Put-heavy (bear)  │ Price DOWN    │ Trend confirms → SHORT (follow)  │
+        │ Put-heavy (bear)  │ Price UP      │ Trend opposes → LONG (contrarian)│
+        │ Put-heavy (bear)  │ No trend data → LONG (contrarian, legacy)   │
+        │ Call-heavy (bull) │ Price UP      │ Trend confirms → LONG (follow)   │
+        │ Call-heavy (bull) │ Price DOWN    │ Trend opposes → SHORT (contrarian)│
+        │ Call-heavy (bull) │ No trend data → SHORT (contrarian, legacy)  │
+        └───────────────────┴───────────────┴──────────────────────────────────┘
+        
+        Confidence adjustment:
+        - Trend-following: confidence based on imbalance + trend strength
+        - Contrarian (trend opposes): confidence reduced by 40%
+        - No trend data: uses legacy contrarian logic (unchanged)
         
         Args:
             call_concentration: Call OI as % of total
@@ -189,6 +233,8 @@ class OIAnalyzer:
             call_walls: List of call OI walls
             put_walls: List of put OI walls
             spot_price: Current spot price
+            price_change_pct: Price change percentage for trend context.
+                Positive = price rising, Negative = price falling.
             
         Returns:
             Tuple of (SignalDirection, confidence)
@@ -206,19 +252,71 @@ class OIAnalyzer:
             if abs(w["distance_from_spot"]) < 0.05
         ]
         
-        # Generate signal based on imbalance
-        if imbalance > 0.15:
-            # Significant put bias - contrarian bullish
-            confidence = min(0.5 + abs(imbalance), 0.8)
-            return SignalDirection.LONG, confidence
+        # Determine if OI has significant imbalance
+        put_heavy = imbalance > 0.15
+        call_heavy = imbalance < -0.15
         
-        elif imbalance < -0.15:
-            # Significant call bias - contrarian bearish
-            confidence = min(0.5 + abs(imbalance), 0.8)
-            return SignalDirection.SHORT, confidence
+        # Calculate base confidence from imbalance magnitude
+        if put_heavy or call_heavy:
+            base_confidence = min(0.5 + abs(imbalance), 0.8)
+        else:
+            base_confidence = 0.0
         
-        # Check for wall effects
-        elif nearby_call_walls and not nearby_put_walls:
+        # Apply trend-aware signal logic for significant imbalances
+        if put_heavy or call_heavy:
+            if price_change_pct is not None and abs(price_change_pct) > 0.01:
+                # We have price trend data - use trend-aware logic
+                price_trending_down = price_change_pct < -0.01
+                price_trending_up = price_change_pct > 0.01
+                
+                if put_heavy:
+                    # More puts = bearish positioning
+                    if price_trending_down:
+                        # Price IS falling → crowd is RIGHT → trend-following SHORT
+                        trend_strength = min(abs(price_change_pct) / 3.0, 0.3)
+                        confidence = min(base_confidence + trend_strength, 0.85)
+                        logger.debug(
+                            f"OI signal: PUT-heavy={imbalance:.2f} + price DOWN={price_change_pct:.2f}% "
+                            f"→ trend confirms bearish → SHORT (follow trend)"
+                        )
+                        return SignalDirection.SHORT, confidence
+                    else:
+                        # Price is rising → crowd may be wrong → contrarian LONG
+                        confidence = base_confidence * 0.6
+                        logger.debug(
+                            f"OI signal: PUT-heavy={imbalance:.2f} + price UP={price_change_pct:.2f}% "
+                            f"→ trend opposes bearish → LONG (contrarian, reduced confidence)"
+                        )
+                        return SignalDirection.LONG, confidence
+                
+                elif call_heavy:
+                    # More calls = bullish positioning
+                    if price_trending_up:
+                        # Price IS rising → crowd is RIGHT → trend-following LONG
+                        trend_strength = min(abs(price_change_pct) / 3.0, 0.3)
+                        confidence = min(base_confidence + trend_strength, 0.85)
+                        logger.debug(
+                            f"OI signal: CALL-heavy={imbalance:.2f} + price UP={price_change_pct:.2f}% "
+                            f"→ trend confirms bullish → LONG (follow trend)"
+                        )
+                        return SignalDirection.LONG, confidence
+                    else:
+                        # Price is falling → crowd may be wrong → contrarian SHORT
+                        confidence = base_confidence * 0.6
+                        logger.debug(
+                            f"OI signal: CALL-heavy={imbalance:.2f} + price DOWN={price_change_pct:.2f}% "
+                            f"→ trend opposes bullish → SHORT (contrarian, reduced confidence)"
+                        )
+                        return SignalDirection.SHORT, confidence
+            
+            # No trend data → use legacy contrarian logic
+            if put_heavy:
+                return SignalDirection.LONG, base_confidence
+            elif call_heavy:
+                return SignalDirection.SHORT, base_confidence
+        
+        # Check for wall effects (no significant imbalance)
+        if nearby_call_walls and not nearby_put_walls:
             # Call wall nearby - resistance
             return SignalDirection.SHORT, 0.4
         

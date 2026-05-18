@@ -554,11 +554,14 @@ class PipelineOrchestrator:
             self._api_calls_made += 5  # Approximate: 0 + 0 + 5
             
             # Run sentiment analysis
+            # BUG FIX (Bug #5): Pass price_change_pct so sentiment can use
+            # trend-aware logic instead of always generating LONG in moderate conditions
             sentiment_analysis = self.sentiment_analyzer.analyze(
                 symbol=symbol,
                 top_trader_position_data=sentiment_data.get("top_trader_position", []),
                 top_trader_account_data=sentiment_data.get("top_trader_account", []),
                 funding_rate_data=sentiment_data.get("funding_rate_history", []),
+                price_change_pct=futures_data.price_change_pct,
             )
             
             logger.debug(
@@ -601,10 +604,42 @@ class PipelineOrchestrator:
             oi_flow = None
             if futures_data and futures_data.open_interest > 0:
                 oi_change_pct = futures_data.open_interest_change_pct if hasattr(futures_data, 'open_interest_change_pct') else 0.0
+                price_change_pct = futures_data.price_change_pct if hasattr(futures_data, 'price_change_pct') else 0.0
+
+                # Determine detailed flow type using both OI change and price change
+                # BUG FIX: Previously only used OI direction (BUILDING/UNWINDING) and
+                # hardcoded LONG for BUILDING. Now correctly classifies:
+                #   OI UP + Price UP   = LONG_BUILDUP   (new longs being created)
+                #   OI UP + Price DOWN = SHORT_BUILDUP  (new shorts being created)
+                #   OI DOWN + Price UP = SHORT_COVERING (shorts closing out)
+                #   OI DOWN + Price DOWN = LONG_UNWINDING (longs liquidating)
+                oi_building = oi_change_pct > 5
+                oi_unwinding = oi_change_pct < -5
+                price_up = price_change_pct > 0
+                price_down = price_change_pct < 0
+
+                if oi_building and price_up:
+                    flow_type = "LONG_BUILDUP"
+                    flow_direction = "BUILDING"
+                elif oi_building and price_down:
+                    flow_type = "SHORT_BUILDUP"
+                    flow_direction = "BUILDING"
+                elif oi_unwinding and price_up:
+                    flow_type = "SHORT_COVERING"
+                    flow_direction = "UNWINDING"
+                elif oi_unwinding and price_down:
+                    flow_type = "LONG_UNWINDING"
+                    flow_direction = "UNWINDING"
+                else:
+                    flow_type = "NEUTRAL"
+                    flow_direction = "STABLE"
+
                 oi_flow = {
                     "current_oi": futures_data.open_interest,
                     "oi_change_estimated": oi_change_pct,
-                    "flow_direction": "BUILDING" if oi_change_pct > 5 else "UNWINDING" if oi_change_pct < -5 else "STABLE",
+                    "price_change_pct": price_change_pct,
+                    "flow_direction": flow_direction,
+                    "flow_type": flow_type,
                 }
             
             # Create advanced_metrics dict for signal scoring
@@ -716,10 +751,55 @@ class PipelineOrchestrator:
         signal_id = f"SIG_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{asset.symbol}"
         
         # Determine signal strength
-        # Boost confidence if whale activity aligns
+        # BUG FIX (Bug #7): Make whale confidence_boost directional.
+        # Previously, confidence_boost was always positive and always added to
+        # confidence, regardless of whether whale direction aligned with the
+        # signal direction. This meant even if whales were selling (BEARISH) and
+        # the signal was LONG, the confidence was boosted, reinforcing the wrong
+        # direction.
+        #
+        # New logic:
+        # - Whale BULLISH + Signal LONG → boost confidence (alignment)
+        # - Whale BEARISH + Signal SHORT → boost confidence (alignment)
+        # - Whale BULLISH + Signal SHORT → reduce confidence (opposition)
+        # - Whale BEARISH + Signal LONG → reduce confidence (opposition)
+        # - Whale NEUTRAL → no change
         confidence = options_signal.confidence
         if whale_analysis and whale_analysis.confidence_boost > 0:
-            confidence = min(confidence + whale_analysis.confidence_boost, 1.0)
+            whale_dir = whale_analysis.whale_net_direction  # "BULLISH", "BEARISH", "NEUTRAL"
+            signal_dir = options_signal.direction
+            
+            if whale_dir == "BULLISH" and signal_dir == SignalDirection.LONG:
+                # Whales buying + LONG signal → aligned, boost confidence
+                confidence = min(confidence + whale_analysis.confidence_boost, 1.0)
+                logger.debug(
+                    f"Whale boost: BULLISH whales align with LONG signal → "
+                    f"+{whale_analysis.confidence_boost:.3f} confidence"
+                )
+            elif whale_dir == "BEARISH" and signal_dir == SignalDirection.SHORT:
+                # Whales selling + SHORT signal → aligned, boost confidence
+                confidence = min(confidence + whale_analysis.confidence_boost, 1.0)
+                logger.debug(
+                    f"Whale boost: BEARISH whales align with SHORT signal → "
+                    f"+{whale_analysis.confidence_boost:.3f} confidence"
+                )
+            elif whale_dir == "BULLISH" and signal_dir == SignalDirection.SHORT:
+                # Whales buying + SHORT signal → opposed, reduce confidence
+                penalty = whale_analysis.confidence_boost * 0.6
+                confidence = max(confidence - penalty, 0.0)
+                logger.debug(
+                    f"Whale penalty: BULLISH whales oppose SHORT signal → "
+                    f"-{penalty:.3f} confidence"
+                )
+            elif whale_dir == "BEARISH" and signal_dir == SignalDirection.LONG:
+                # Whales selling + LONG signal → opposed, reduce confidence
+                penalty = whale_analysis.confidence_boost * 0.6
+                confidence = max(confidence - penalty, 0.0)
+                logger.debug(
+                    f"Whale penalty: BEARISH whales oppose LONG signal → "
+                    f"-{penalty:.3f} confidence"
+                )
+            # else: whale_dir == "NEUTRAL" → no adjustment
         
         if confidence >= 0.8:
             strength = SignalStrength.VERY_STRONG

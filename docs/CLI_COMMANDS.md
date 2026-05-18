@@ -47,6 +47,8 @@ pip install -e . --force-reinstall
 
 # Test the CLI
 python -m binance_signal_generator --version
+
+cd /home/haradhan/workspace/binanace-opt-fut && venv/bin/python scripts/deliver_signals.py
 ```
 
 ### Verify Installation
