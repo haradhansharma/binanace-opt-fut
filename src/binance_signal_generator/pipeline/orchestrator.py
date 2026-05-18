@@ -603,8 +603,11 @@ class PipelineOrchestrator:
             # 6. OI Flow Analysis (requires historical data - use futures data)
             oi_flow = None
             if futures_data and futures_data.open_interest > 0:
-                oi_change_pct = futures_data.open_interest_change_pct if hasattr(futures_data, 'open_interest_change_pct') else 0.0
-                price_change_pct = futures_data.price_change_pct if hasattr(futures_data, 'price_change_pct') else 0.0
+                # BUG FIX (Bug #2): FuturesData now has open_interest_change_pct field.
+                # Previously used hasattr() which always returned False, making OI flow
+                # always NEUTRAL and wasting 12% signal weight.
+                oi_change_pct = futures_data.open_interest_change_pct
+                price_change_pct = futures_data.price_change_pct
 
                 # Determine detailed flow type using both OI change and price change
                 # BUG FIX: Previously only used OI direction (BUILDING/UNWINDING) and
@@ -613,8 +616,22 @@ class PipelineOrchestrator:
                 #   OI UP + Price DOWN = SHORT_BUILDUP  (new shorts being created)
                 #   OI DOWN + Price UP = SHORT_COVERING (shorts closing out)
                 #   OI DOWN + Price DOWN = LONG_UNWINDING (longs liquidating)
-                oi_building = oi_change_pct > 5
-                oi_unwinding = oi_change_pct < -5
+                #
+                # BUG FIX (Bug #11): Lowered OI change threshold from ±5% to ±2%.
+                # The previous ±5% threshold was too high — daily BTC OI changes under
+                # 5% are very common (e.g., OI going from 20,000 to 20,800 = +4% was
+                # classified as NEUTRAL). This meant the OI flow signal (12% weight)
+                # frequently returned NEUTRAL, wasting its weight allocation.
+                # ±2% captures meaningful OI flow changes while filtering noise.
+                # For intraday mode, the threshold is further halved to ±1% since
+                # OI changes over hours are smaller than daily.
+                oi_threshold = 2.0  # Default: ±2% for daily
+                intraday_config = getattr(self.config, 'intraday', None)
+                if intraday_config and intraday_config.enabled:
+                    oi_threshold = 1.0  # ±1% for intraday (smaller OI changes over hours)
+                
+                oi_building = oi_change_pct > oi_threshold
+                oi_unwinding = oi_change_pct < -oi_threshold
                 price_up = price_change_pct > 0
                 price_down = price_change_pct < 0
 

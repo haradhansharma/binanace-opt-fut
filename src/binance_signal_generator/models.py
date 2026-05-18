@@ -74,6 +74,13 @@ class OptionsChain:
     Complete options chain for an underlying asset.
     
     Contains all strike data and aggregated metrics for Options analysis.
+    
+    BUG FIX (Bug #12): Added total_call_notional and total_put_notional fields.
+    After Bug #4 fix changed total_call_volume/total_put_volume to use contract
+    count instead of USDT notional, the volume PCR (put_contracts / call_contracts)
+    became essentially the same as OI PCR (put_OI / call_OI). The notional fields
+    restore the distinction: volume PCR (contract count) captures activity level,
+    while notional PCR captures capital flow (where big money is trading).
     """
     underlying: str
     spot_price: float
@@ -81,8 +88,15 @@ class OptionsChain:
     strikes: Dict[float, StrikeData] = field(default_factory=dict)
     total_call_oi: int = 0
     total_put_oi: int = 0
-    total_call_volume: float = 0.0
-    total_put_volume: float = 0.0
+    total_call_volume: float = 0.0  # BUG FIX (Bug #4): Contract count for PCR
+    total_put_volume: float = 0.0   # BUG FIX (Bug #4): Contract count for PCR
+    # BUG FIX (Bug #12): Notional (USDT) volume for capital-flow based PCR.
+    # This captures WHERE the big money is trading, distinct from the contract
+    # count which captures HOW MANY contracts are changing hands. Deep ITM options
+    # have much higher notional per contract, so notional PCR reveals different
+    # information than contract count PCR.
+    total_call_notional: float = 0.0  # Total USDT notional for call volume
+    total_put_notional: float = 0.0   # Total USDT notional for put volume
     expiry: Optional[datetime] = None
     avg_call_iv: float = 0.0  # Average implied volatility for calls
     avg_put_iv: float = 0.0   # Average implied volatility for puts
@@ -94,10 +108,24 @@ class OptionsChain:
         return self.total_put_oi / self.total_call_oi
     
     def get_volume_pcr(self) -> float:
-        """Calculate Put/Call Ratio based on Volume."""
+        """Calculate Put/Call Ratio based on Volume (contract count)."""
         if self.total_call_volume == 0:
             return float('inf') if self.total_put_volume > 0 else 1.0
         return self.total_put_volume / self.total_call_volume
+    
+    def get_notional_pcr(self) -> float:
+        """
+        Calculate Put/Call Ratio based on Notional Volume (USDT).
+        
+        BUG FIX (Bug #12): This method provides the notional-based PCR that was
+        lost when Bug #4 changed total_call_volume/total_put_volume from USDT
+        notional to contract count. Notional PCR reveals capital flow direction:
+        high notional PCR means more capital is flowing into puts than calls,
+        which is a stronger bearish signal than just more put contracts traded.
+        """
+        if self.total_call_notional == 0:
+            return float('inf') if self.total_put_notional > 0 else 1.0
+        return self.total_put_notional / self.total_call_notional
 
 
 # =============================================================================
@@ -112,6 +140,7 @@ class FuturesData:
     timestamp: datetime
     volume_24h: float = 0.0
     open_interest: float = 0.0
+    open_interest_change_pct: float = 0.0  # BUG FIX (Bug #2): Added missing field — previously orchestrator.py used hasattr() which always returned False
     funding_rate: float = 0.0
     mark_price: float = 0.0
     index_price: float = 0.0

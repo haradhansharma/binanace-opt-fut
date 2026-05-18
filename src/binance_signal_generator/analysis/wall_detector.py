@@ -32,17 +32,24 @@ class WallDetectorConfig:
     # ANALYSIS: With ~18K total OI across 70+ strikes for BTC, OI is very distributed.
     # Max single-strike OI observed: ~121 contracts (0.67% of total)
     # Previous threshold of 2% (361 contracts) was too high - no walls detected.
-    # New threshold: 0.5% allows strikes with ~90+ contracts to be detected.
-    min_oi_concentration: float = 0.005   # 0.5% of total OI (lowered from 2%)
+    # Previous fix to 0.5% was still too restrictive — only the very top strikes pass.
+    #
+    # BUG FIX (Bug #7): Lowered threshold to 0.2% to catch meaningful OI concentrations
+    # that still represent significant hedging pressure. With ~18K total OI:
+    #   - 0.2% = ~36 contracts (catches top 5-10 strikes, enough for S/R levels)
+    #   - Also lowered min_absolute_oi from 25 to 10 for smaller underlyings
+    # This ensures wall_concentration signal (4% weight) and wall-based SL/TP
+    # levels are populated for most active underlyings.
+    min_oi_concentration: float = 0.002   # 0.2% of total OI (lowered from 0.5%)
 
     # Major wall threshold - also lowered proportionally
-    major_wall_concentration: float = 0.02  # 2% of total OI (lowered from 10%)
+    major_wall_concentration: float = 0.01  # 1% of total OI (lowered from 2%)
 
     # Distance from spot (in %)
     max_wall_distance: float = 15.0  # 15% from spot
 
     # Minimum absolute OI - lowered to catch smaller but significant walls
-    min_absolute_oi: int = 25  # Lowered from 50 for better detection
+    min_absolute_oi: int = 10  # Lowered from 25 for better detection across underlyings
 
 
 class WallDetector:

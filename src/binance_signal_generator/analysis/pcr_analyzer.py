@@ -42,8 +42,13 @@ class PCRConfig:
     pcr_extreme_high: float = 1.5      # Very put-heavy
     pcr_extreme_low: float = 0.5       # Very call-heavy
     
-    # Weight for volume PCR vs OI PCR
-    volume_weight: float = 0.4         # 40% volume, 60% OI
+    # BUG FIX (Bug #12): Weight for notional PCR vs OI PCR.
+    # Previously called "volume_weight" but now uses notional (USDT) PCR.
+    # The 40% weight for notional PCR captures short-term capital flow
+    # (where big money is trading), while 60% OI PCR captures structural
+    # positioning. This restores the distinction lost when Bug #4 changed
+    # total_call_volume/total_put_volume from notional to contract count.
+    volume_weight: float = 0.4         # 40% notional PCR, 60% OI PCR
     
     # Minimum OI for valid analysis
     min_total_oi: int = 100
@@ -96,6 +101,14 @@ class PCRAnalyzer:
         """
         Analyze PCR from options chain.
         
+        BUG FIX (Bug #12): Volume PCR now uses notional (USDT) based PCR instead
+        of contract count PCR. After Bug #4 fix changed total_call_volume/total_put_volume
+        to contract count, volume PCR (put_contracts / call_contracts) became essentially
+        the same as OI PCR (put_OI / call_OI) — both measure the put/call ratio by
+        contract count. Notional PCR (put_USDT / call_USDT) captures capital flow:
+        where the big money is trading. Deep ITM options have much higher notional per
+        contract, so notional PCR reveals different information than contract count PCR.
+        
         Args:
             chain: Options chain data
             price_change_pct: Optional price change percentage for trend context.
@@ -116,7 +129,11 @@ class PCRAnalyzer:
         
         # Calculate PCR values
         pcr_oi = chain.get_pcr()
-        pcr_volume = chain.get_volume_pcr()
+        # BUG FIX (Bug #12): Use notional-based PCR for the volume component.
+        # After Bug #4, chain.get_volume_pcr() returns put_contracts/call_contracts
+        # which is redundant with OI PCR. Notional PCR (put_USDT / call_USDT) captures
+        # short-term capital flow direction, distinct from structural OI positioning.
+        pcr_volume = chain.get_notional_pcr()
         
         # Calculate combined PCR
         pcr_combined = self._calculate_combined_pcr(pcr_oi, pcr_volume)
@@ -249,9 +266,14 @@ class PCRAnalyzer:
             return SignalDirection.NEUTRAL, 0.2
         
         # Apply trend-aware signal logic
-        # FIX: Use ATR-based thresholds instead of hardcoded 0.01%
-        # Crypto 15m ATR is typically 0.3-0.8%, so 0.01% is noise
-        trend_threshold = 0.15  # Conservative for crypto
+        # BUG FIX (Bug #10): Lowered threshold from 0.15% to 0.05%.
+        # Previously, when price_change_pct was between -0.15% and +0.15%, the
+        # code fell back to legacy contrarian logic where high PCR → LONG. Since
+        # PCR is typically > 1.0 in crypto (more puts as protection), this
+        # fallback systematically contributed LONG signal, adding to structural
+        # LONG bias. The 0.05% threshold activates trend-aware logic for almost
+        # all non-flat periods, reducing the contrarian LONG fallback frequency.
+        trend_threshold = 0.05
         if price_change_pct is not None and abs(price_change_pct) > trend_threshold:
             # We have price trend data - use trend-aware logic
             price_trending_down = price_change_pct < -trend_threshold

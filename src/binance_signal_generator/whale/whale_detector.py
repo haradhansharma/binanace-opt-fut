@@ -561,10 +561,12 @@ class WhaleDetector:
         if underlying_trades:
             logger.debug(f"Sample block trade for {options_chain.underlying}: {underlying_trades[0]}")
         
-        # Calculate total premium - for USDT-margined options, already in USDT
-        premiums_usd = []
+        # BUG FIX (Bug #9): Detect whether quoteQty is in base currency (BTC/ETH)
+        # or USDT, same as options_fetcher._calculate_whale_activity().
+        # Detection heuristic: If avg premium < 0.1% of spot, it's base currency.
+        spot_price = options_chain.spot_price
+        raw_premiums = []
         for trade in underlying_trades:
-            # Try multiple field name variations
             quote_qty = (
                 trade.get("quoteQty") or
                 trade.get("quote_qty") or
@@ -574,11 +576,26 @@ class WhaleDetector:
                 trade.get("total") or
                 0
             )
-            quote_qty = abs(float(quote_qty) if quote_qty else 0)
-            
-            # For USDT-margined options, already in USDT
-            premium_usd = quote_qty
-            
+            raw_premium = abs(float(quote_qty) if quote_qty else 0)
+            raw_premiums.append(raw_premium)
+        
+        avg_raw_premium = sum(raw_premiums) / len(raw_premiums) if raw_premiums else 0
+        is_base_currency = False
+        if spot_price > 0 and avg_raw_premium > 0:
+            if avg_raw_premium < spot_price * 0.001:
+                is_base_currency = True
+                logger.debug(
+                    f"Detected base-currency quoteQty for {options_chain.underlying}: "
+                    f"avg_raw={avg_raw_premium:.4f}, spot={spot_price:.2f} → converting"
+                )
+        
+        # Calculate total premium with currency conversion if needed
+        premiums_usd = []
+        for i, raw_premium in enumerate(raw_premiums):
+            if is_base_currency and spot_price > 0:
+                premium_usd = raw_premium * spot_price
+            else:
+                premium_usd = raw_premium
             premiums_usd.append(premium_usd)
         
         total_premium_usd = sum(premiums_usd)
@@ -608,25 +625,43 @@ class WhaleDetector:
                 0
             )
             quote_qty = abs(float(quote_qty) if quote_qty else 0)
-            side = trade.get("side", 0)  # -1 = sell, 1 = buy
+            # BUG FIX (Bug #6): The block trades API may return 'side' as either
+            # an integer (-1 = sell, 1 = buy) OR a string ("BUY"/"SELL").
+            # Previously, this code only handled the integer format, so if the API
+            # returned a string, side == -1 was always False → all trades appeared
+            # as "buy" (bullish), creating a systematic LONG bias in whale analysis.
+            # Now we normalize both formats to a string: "BUY" or "SELL".
+            raw_side = trade.get("side", 0)
+            if isinstance(raw_side, str):
+                side = raw_side.upper()  # "BUY" or "SELL"
+            elif raw_side == -1:
+                side = "SELL"
+            elif raw_side == 1:
+                side = "BUY"
+            else:
+                side = "BUY"  # Default: treat unknown as buy (conservative)
             
-            # For USDT-margined options, already in USDT
-            premium_usd = quote_qty
+            # BUG FIX (Bug #9): Apply same currency conversion as first loop
+            if is_base_currency and spot_price > 0:
+                premium_usd = quote_qty * spot_price
+            else:
+                premium_usd = quote_qty
             
             # Determine option type
             if "-C" in symbol:
                 call_premium_usd += premium_usd
-                # Side -1 = selling calls = bearish
-                # Side 1 = buying calls = bullish
-                if side == -1:
+                # BUG FIX (Bug #6): Now using string comparison instead of integer.
+                # Side SELL = selling calls = bearish
+                # Side BUY = buying calls = bullish
+                if side == "SELL":
                     sell_side_premium_usd += premium_usd  # Short call = bearish
                 else:
                     buy_side_premium_usd += premium_usd  # Long call = bullish
             elif "-P" in symbol:
                 put_premium_usd += premium_usd
-                # Side -1 = selling puts = bullish
-                # Side 1 = buying puts = bearish
-                if side == -1:
+                # Side SELL = selling puts = bullish
+                # Side BUY = buying puts = bearish
+                if side == "SELL":
                     buy_side_premium_usd += premium_usd  # Short put = bullish
                 else:
                     sell_side_premium_usd += premium_usd  # Long put = bearish

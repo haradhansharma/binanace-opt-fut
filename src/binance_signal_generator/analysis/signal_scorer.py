@@ -169,8 +169,14 @@ class SignalScorer:
         
         # Derive advanced metric signals (NEW - Section 6.5 implementation)
         oi_flow_signal, oi_flow_confidence = self._derive_oi_flow_signal(advanced_metrics)
-        wall_conc_signal, wall_conc_confidence = self._derive_wall_concentration_signal(wall_analysis, whale_volume_analysis)
-        pcr_strike_signal, pcr_strike_confidence = self._derive_pcr_strike_signal(advanced_metrics, chain.spot_price)
+        # BUG FIX (Bug #10): Pass price_change_pct to wall and PCR strike signals
+        # so they can dampen LONG bias when price is dropping (support failing)
+        wall_conc_signal, wall_conc_confidence = self._derive_wall_concentration_signal(
+            wall_analysis, whale_volume_analysis, price_change_pct=price_change_pct
+        )
+        pcr_strike_signal, pcr_strike_confidence = self._derive_pcr_strike_signal(
+            advanced_metrics, chain.spot_price, price_change_pct=price_change_pct
+        )
         whale_flow_signal, whale_flow_confidence = self._derive_whale_flow_signal(whale_volume_analysis)
         # FIX: IV term structure removed — always returned NEUTRAL,0.0 because
         # the pipeline only has single-expiry data. Its 3% weight was dead weight.
@@ -512,6 +518,7 @@ class SignalScorer:
         self,
         wall_analysis: Optional[Any],
         whale_volume_analysis: Optional[Dict[str, Any]],
+        price_change_pct: Optional[float] = None,
     ) -> tuple:
         """
         Derive trading signal from wall concentration analysis.
@@ -521,9 +528,19 @@ class SignalScorer:
         - High wall imbalance (call walls > put walls) = Resistance above = SHORT bias
         - Concentrated whale activity at specific strikes = directional conviction
         
+        BUG FIX (Bug #10): Added price trend context. In crypto, put walls (support)
+        are systematically more common than call walls because traders buy puts for
+        portfolio protection. This creates a structural LONG bias: wall_imbalance > 0
+        → LONG dominates. When price is actively dropping, support walls are being
+        tested or failing, so the LONG bias from put walls should be dampened.
+        Conversely, when price is rising, call walls (resistance) failing should
+        reduce the SHORT bias.
+        
         Args:
             wall_analysis: Wall detection analysis
             whale_volume_analysis: Whale volume analysis
+            price_change_pct: Price change percentage for trend context.
+                Positive = price rising, Negative = price falling.
             
         Returns:
             Tuple of (SignalDirection, confidence)
@@ -544,6 +561,29 @@ class SignalScorer:
                 signal = SignalDirection.SHORT
                 confidence = min(abs(imbalance), 0.7)
         
+        # BUG FIX (Bug #10): Dampen wall signal confidence when price trend
+        # opposes the wall direction. In crypto, put walls (support) are more
+        # common due to hedging, creating structural LONG bias. When price is
+        # actively dropping, support walls may be failing → reduce LONG confidence.
+        # When price is rising, resistance walls may be failing → reduce SHORT confidence.
+        if price_change_pct is not None and confidence > 0:
+            if signal == SignalDirection.LONG and price_change_pct < -0.3:
+                # Put walls suggest support, but price is dropping → support may be failing
+                dampening = max(0.4, 1.0 - abs(price_change_pct) * 0.2)
+                confidence *= dampening
+                logger.debug(
+                    f"Wall signal dampened: LONG from put walls but price dropping "
+                    f"({price_change_pct:.2f}%) → confidence * {dampening:.2f}"
+                )
+            elif signal == SignalDirection.SHORT and price_change_pct > 0.3:
+                # Call walls suggest resistance, but price is rising → resistance may be failing
+                dampening = max(0.4, 1.0 - abs(price_change_pct) * 0.2)
+                confidence *= dampening
+                logger.debug(
+                    f"Wall signal dampened: SHORT from call walls but price rising "
+                    f"({price_change_pct:.2f}%) → confidence * {dampening:.2f}"
+                )
+        
         # Boost confidence if whale concentration aligns
         if whale_volume_analysis:
             concentration = whale_volume_analysis.get("concentration", {})
@@ -557,6 +597,7 @@ class SignalScorer:
         self,
         advanced_metrics: Optional[Dict[str, Any]],
         spot_price: float,
+        price_change_pct: Optional[float] = None,
     ) -> tuple:
         """
         Derive trading signal from PCR by strike alignment.
@@ -566,9 +607,19 @@ class SignalScorer:
         - Call-heavy strikes near spot = potential resistance = SHORT bias
         - Alignment with signal direction boosts confidence
         
+        BUG FIX (Bug #10): Added price trend context and proximity weighting.
+        In crypto, put-heavy strikes below spot (protection puts) systematically
+        dominate, creating structural LONG bias. Two fixes:
+        1. Weight strikes by proximity to spot — nearby strikes matter more than
+           distant ones for immediate price action.
+        2. Dampen LONG confidence when price is actively dropping (support failing)
+           and dampen SHORT confidence when price is rising (resistance failing).
+        
         Args:
             advanced_metrics: Dict with pcr_by_strike data
             spot_price: Current spot price
+            price_change_pct: Price change percentage for trend context.
+                Positive = price rising, Negative = price falling.
             
         Returns:
             Tuple of (SignalDirection, confidence)
@@ -583,18 +634,74 @@ class SignalScorer:
         put_heavy_count = pcr_by_strike.get("put_heavy_count", 0)
         call_heavy_count = pcr_by_strike.get("call_heavy_count", 0)
         
-        # Determine signal based on which strikes dominate
-        if put_heavy_count > call_heavy_count * 1.5:
-            # More put-heavy strikes = potential support = LONG bias
-            signal = SignalDirection.LONG
-            confidence = min((put_heavy_count - call_heavy_count) * 0.15, 0.6)
-        elif call_heavy_count > put_heavy_count * 1.5:
-            # More call-heavy strikes = potential resistance = SHORT bias
-            signal = SignalDirection.SHORT
-            confidence = min((call_heavy_count - put_heavy_count) * 0.15, 0.6)
+        # BUG FIX (Bug #10): Use proximity-weighted counts instead of raw counts.
+        # Raw counts favor put-heavy (LONG) because crypto has many OTM put strikes
+        # as protection. By weighting each strike by proximity to spot, we give
+        # more importance to strikes that are near the current price, which is
+        # more relevant for immediate trading decisions.
+        strike_pcrs = pcr_by_strike.get("strike_pcrs", [])
+        if strike_pcrs:
+            # Weight by proximity: strikes within 5% of spot get full weight,
+            # strikes 5-15% away get partial weight, beyond 15% get 0.1x weight
+            proximity_weighted_put = 0.0
+            proximity_weighted_call = 0.0
+            for s in strike_pcrs:
+                distance = abs(s.get("distance_from_spot", 100))
+                if distance <= 5:
+                    weight = 1.0
+                elif distance <= 15:
+                    weight = 0.5
+                else:
+                    weight = 0.1
+                
+                pcr_val = s.get("pcr", 1.0)
+                if pcr_val >= 1.2:  # put-heavy threshold
+                    proximity_weighted_put += weight
+                elif pcr_val <= 0.8:  # call-heavy threshold
+                    proximity_weighted_call += weight
+            
+            # Use proximity-weighted counts for signal determination
+            if proximity_weighted_put > proximity_weighted_call * 1.5:
+                signal = SignalDirection.LONG
+                confidence = min((proximity_weighted_put - proximity_weighted_call) * 0.15, 0.6)
+            elif proximity_weighted_call > proximity_weighted_put * 1.5:
+                signal = SignalDirection.SHORT
+                confidence = min((proximity_weighted_call - proximity_weighted_put) * 0.15, 0.6)
+            else:
+                signal = SignalDirection.NEUTRAL
+                confidence = 0.0
         else:
-            signal = SignalDirection.NEUTRAL
-            confidence = 0.0
+            # Fallback to raw counts if strike_pcrs not available
+            if put_heavy_count > call_heavy_count * 1.5:
+                signal = SignalDirection.LONG
+                confidence = min((put_heavy_count - call_heavy_count) * 0.15, 0.6)
+            elif call_heavy_count > put_heavy_count * 1.5:
+                signal = SignalDirection.SHORT
+                confidence = min((call_heavy_count - put_heavy_count) * 0.15, 0.6)
+            else:
+                signal = SignalDirection.NEUTRAL
+                confidence = 0.0
+        
+        # BUG FIX (Bug #10): Dampen signal when price trend opposes the strike alignment.
+        # When put-heavy strikes suggest support (LONG) but price is dropping,
+        # support may be failing → reduce LONG confidence.
+        # When call-heavy strikes suggest resistance (SHORT) but price is rising,
+        # resistance may be failing → reduce SHORT confidence.
+        if price_change_pct is not None and confidence > 0:
+            if signal == SignalDirection.LONG and price_change_pct < -0.3:
+                dampening = max(0.4, 1.0 - abs(price_change_pct) * 0.15)
+                confidence *= dampening
+                logger.debug(
+                    f"PCR strike signal dampened: LONG from put-heavy strikes but price dropping "
+                    f"({price_change_pct:.2f}%) → confidence * {dampening:.2f}"
+                )
+            elif signal == SignalDirection.SHORT and price_change_pct > 0.3:
+                dampening = max(0.4, 1.0 - abs(price_change_pct) * 0.15)
+                confidence *= dampening
+                logger.debug(
+                    f"PCR strike signal dampened: SHORT from call-heavy strikes but price rising "
+                    f"({price_change_pct:.2f}%) → confidence * {dampening:.2f}"
+                )
         
         return signal, round(confidence, 3)
     
@@ -666,76 +773,11 @@ class SignalScorer:
         
         return signal, round(min(confidence, 0.85), 3)
     
-    def _derive_iv_term_structure_signal(
-        self,
-        advanced_metrics: Optional[Dict[str, Any]],
-    ) -> tuple:
-        """
-        IMPROVED: IV-003 - Derive trading signal from IV term structure analysis.
-        
-        IV Term Structure Signal Logic:
-        - INVERTED (Short IV > Long IV): Near-term volatility expected
-          - Strong inversion: Prepare for significant price move
-          - Direction determined by other signals
-        - UPWARD (Long IV > Short IV): Normal term structure
-          - Standard market conditions
-        - FLAT: Uniform IV expectations
-        
-        Signal Weight:
-        - IV term structure is primarily a volatility indicator
-        - Direction is typically NEUTRAL (use other signals for direction)
-        - Confidence indicates expected volatility magnitude
-        
-        Args:
-            advanced_metrics: Dict with iv_term_structure data
-            
-        Returns:
-            Tuple of (SignalDirection, confidence)
-        """
-        if not advanced_metrics:
-            return SignalDirection.NEUTRAL, 0.0
-        
-        iv_term_structure = advanced_metrics.get("iv_term_structure")
-        if not iv_term_structure:
-            return SignalDirection.NEUTRAL, 0.0
-        
-        shape = iv_term_structure.get("shape", "INSUFFICIENT_DATA")
-        term_structure = iv_term_structure.get("term_structure", [])
-        
-        if shape == "INSUFFICIENT_DATA" or shape == "SINGLE_EXPIRY" or shape == "AGGREGATE":
-            return SignalDirection.NEUTRAL, 0.0
-        
-        # Calculate inversion ratio if we have multiple expiries
-        if len(term_structure) >= 2:
-            short_iv = term_structure[0].get("atm_iv", 0)
-            long_iv = term_structure[-1].get("atm_iv", 0)
-            
-            if long_iv > 0:
-                inversion_ratio = (short_iv - long_iv) / long_iv
-            else:
-                inversion_ratio = 0.0
-            
-            if shape == "INVERTED":
-                # Inverted term indicate near-term volatility
-                # Use inversion magnitude for confidence
-                if inversion_ratio > 0.3:
-                    return SignalDirection.NEUTRAL, 0.5  # High volatility expected
-                elif inversion_ratio > 0.15:
-                    return SignalDirection.NEUTRAL, 0.35
-                else:
-                    return SignalDirection.NEUTRAL, 0.2
-            
-            elif shape == "UPWARD":
-                # Normal upward sloping
-                if long_iv > short_iv * 1.3:
-                    return SignalDirection.NEUTRAL, 0.15
-                else:
-                    return SignalDirection.NEUTRAL, 0.1
-            
-            else:  # FLAT
-                return SignalDirection.NEUTRAL, 0.05
-        
-        return SignalDirection.NEUTRAL, 0.0
+    # BUG FIX (Bug #8): Removed dead _derive_iv_term_structure_signal() method.
+    # This method was never called in the analyze() pipeline — its weight was
+    # removed from SignalScorerConfig, making it dead code that confused maintainers.
+    # The IV term structure data is still available in advanced_metrics for future use
+    # if a weight is added back to the scoring config.
     
     def _combine_signals(
         self,
@@ -865,6 +907,39 @@ class SignalScorer:
             signal_list.append(whale_flow_signal)
         
         agreement = self._calculate_agreement(*signal_list)
+        
+        # BUG FIX (Bug #10): Structural LONG bias correction.
+        # Certain signals (max_pain, wall_conc, pcr_strike) systematically favor
+        # LONG in crypto markets due to structural factors (max pain above spot,
+        # put walls for protection, put-heavy strikes). When these three signals
+        # all point LONG but the more balanced signals (oi_flow, sentiment) don't
+        # confirm, we reduce the raw_score to correct the bias.
+        #
+        # Identification: If max_pain, wall_conc, and pcr_strike are all LONG,
+        # but oi_flow and sentiment are NOT LONG, apply a correction.
+        long_biased_signals = [
+            weighted_signals.get("max_pain", 0),
+            weighted_signals.get("wall_conc", 0),
+            weighted_signals.get("pcr_strike", 0),
+        ]
+        balanced_signals = [
+            weighted_signals.get("oi_flow", 0),
+            weighted_signals.get("sentiment", 0),
+        ]
+        
+        # Check if all LONG-biased signals are positive while balanced signals aren't confirming
+        all_biased_long = all(s > 0 for s in long_biased_signals) and any(s > 0 for s in long_biased_signals)
+        balanced_not_confirming = not all(s > 0 for s in balanced_signals)
+        
+        if all_biased_long and balanced_not_confirming and raw_score > 0:
+            # Apply a 25% reduction to the raw_score to correct structural LONG bias
+            correction = raw_score * 0.25
+            raw_score = raw_score - correction
+            logger.debug(
+                f"Structural LONG bias correction: biased signals all LONG but "
+                f"balanced signals don't confirm → raw_score reduced by {correction:.4f} "
+                f"(from {raw_score + correction:.4f} to {raw_score:.4f})"
+            )
         
         # Determine direction
         if raw_score > 0.15:

@@ -771,6 +771,12 @@ class OptionsFetcher:
             total_put_oi = 0
             total_call_volume = 0.0
             total_put_volume = 0.0
+            # BUG FIX (Bug #12): Track notional (USDT) volume separately from
+            # contract count. After Bug #4 fix changed total_call_volume/total_put_volume
+            # to contract count, volume PCR became redundant with OI PCR. Notional
+            # PCR captures capital flow direction, which is distinct information.
+            total_call_notional = 0.0
+            total_put_notional = 0.0
             matched_count = 0
             oi_matched_count = 0
             iv_matched_count = 0
@@ -815,10 +821,26 @@ class OptionsFetcher:
                 gamma = 0.0
                 
                 if mark:
-                    # Convert IV from decimal to percentage (1.45 -> 145%)
+                    # BUG FIX (Bug #3): Binance Options API returns markIV as a decimal
+                    # where 1.45 = 145% annualized. We normalize to a consistent format.
+                    # The codebase convention is to store IV in decimal form (1.45 = 145%).
+                    # However, some API responses or assets may return IV as percentage
+                    # (e.g., 45.0 meaning 45%). We detect and convert:
+                    #   - Values > 10.0 are assumed to be in percentage format → divide by 100
+                    #   - Values <= 10.0 are assumed to be in decimal format (already correct)
+                    # This prevents cascading errors in IVAnalyzer, gamma exposure, and
+                    # signal scorer.
                     iv_str = mark.get("mark_iv") or mark.get("markIV") or "0"
                     try:
                         iv = float(iv_str) if iv_str else 0.0
+                        # Auto-detect format: Binance typically returns decimal (0.45 = 45%)
+                        # but if value > 10, it's likely in percentage format (45.0 = 45%)
+                        if iv > 10.0:
+                            iv = iv / 100.0
+                            logger.debug(
+                                f"IV format auto-corrected for {symbol}: "
+                                f"raw={iv_str}, converted={iv:.4f} (decimal format)"
+                            )
                     except (ValueError, TypeError):
                         iv = 0.0
                     
@@ -862,18 +884,40 @@ class OptionsFetcher:
                 # No conversion needed
                 volume_value = amount if amount > 0 else volume * last_price
                 
+                # BUG FIX (Bug #4): Volume PCR was previously using USDT notional
+                # (volume_value), which skews the ratio because deep ITM options
+                # have much higher notional per contract. PCR should use contract
+                # count (volume) for an apples-to-apples comparison of activity.
+                # We now track BOTH: contract volume for PCR, and notional for
+                # total activity metrics.
+                contract_volume = int(volume)  # Contract count for PCR
+                
+                # BUG FIX (Bug #12): Track notional (USDT) volume for capital-flow
+                # based PCR. This was lost when Bug #4 fix changed total_call_volume
+                # from notional to contract count. Notional reveals WHERE big money
+                # is trading (deep ITM options have much higher notional per contract).
+                notional_volume = volume_value  # USDT value of traded volume
+                
                 if side == "CALL":
                     strikes[strike].call = option_data
                     total_call_oi += int(oi)
-                    total_call_volume += volume_value
+                    total_call_volume += contract_volume  # BUG FIX (Bug #4): Use contract count, not USDT notional
+                    total_call_notional += notional_volume  # BUG FIX (Bug #12): Track USDT notional separately
                 elif side == "PUT":
                     strikes[strike].put = option_data
                     total_put_oi += int(oi)
-                    total_put_volume += volume_value
+                    total_put_volume += contract_volume  # BUG FIX (Bug #4): Use contract count, not USDT notional
+                    total_put_notional += notional_volume  # BUG FIX (Bug #12): Track USDT notional separately
             
             # Calculate average IV for chain
             avg_call_iv = total_call_iv / call_iv_count if call_iv_count > 0 else 0.0
             avg_put_iv = total_put_iv / put_iv_count if put_iv_count > 0 else 0.0
+            
+            # BUG FIX (Bug #5): Extract nearest expiry from option symbols so that
+            # gamma_exposure.py can calculate real DTE instead of always defaulting
+            # to 7 days. Previously, OptionsChain.expiry was never populated, causing
+            # _calculate_dte() to always return 7.0 and making DTE weighting non-functional.
+            nearest_expiry = self._extract_nearest_expiry(option_symbols)
             
             logger.debug(
                 f"Option chain for {underlying}: {len(strikes)} strikes, "
@@ -882,6 +926,7 @@ class OptionsFetcher:
                 f"{iv_matched_count}/{len(option_symbols)} IV matched, "
                 f"CallOI: {total_call_oi}, PutOI: {total_put_oi}, "
                 f"CallVol: {total_call_volume:.2f}, PutVol: {total_put_volume:.2f}, "
+                f"CallNotional: {total_call_notional:.2f}, PutNotional: {total_put_notional:.2f}, "
                 f"AvgCallIV: {avg_call_iv:.2%}, AvgPutIV: {avg_put_iv:.2%}"
             )
             
@@ -894,8 +939,11 @@ class OptionsFetcher:
                 total_put_oi=total_put_oi,
                 total_call_volume=total_call_volume,
                 total_put_volume=total_put_volume,
+                total_call_notional=total_call_notional,  # BUG FIX (Bug #12): Populate notional fields
+                total_put_notional=total_put_notional,    # BUG FIX (Bug #12): Populate notional fields
                 avg_call_iv=avg_call_iv,
                 avg_put_iv=avg_put_iv,
+                expiry=nearest_expiry,  # BUG FIX (Bug #5): Populate expiry for DTE calculation
             )
             
         except Exception as e:
@@ -1001,7 +1049,16 @@ class OptionsFetcher:
             return 0.0
         
         # Calculate total premium traded in USD
-        # For USDT-margined options, values should already be in USDT
+        # BUG FIX (Bug #9): Added currency detection and conversion for quoteQty.
+        # Previously, the code assumed quoteQty is always in USDT for USDT-margined
+        # options. However, the Binance API may return quoteQty in base currency
+        # (BTC, ETH) depending on the endpoint. If quoteQty is in base currency,
+        # all premium calculations are off by the spot price factor (e.g., 80x for BTC).
+        #
+        # Detection heuristic: If the average premium per trade is unreasonably small
+        # compared to the spot price (e.g., avg premium < spot * 0.001), it's likely
+        # in base currency. We then multiply by spot price to convert to USDT.
+        #
         # Log sample trade to understand API response format
         if underlying_trades:
             sample_trade = underlying_trades[0]
@@ -1010,9 +1067,9 @@ class OptionsFetcher:
         total_premium_usd = 0.0
         large_trades = 0
         
+        # First pass: collect raw premiums to detect currency
+        raw_premiums = []
         for trade in underlying_trades:
-            # For USDT-margined options, quoteQty should be in USDT
-            # Try multiple field name variations
             quote_qty = (
                 trade.get("quoteQty") or
                 trade.get("quote_qty") or
@@ -1022,10 +1079,32 @@ class OptionsFetcher:
                 trade.get("total") or
                 0
             )
-            quote_qty = abs(float(quote_qty) if quote_qty else 0)
+            raw_premium = abs(float(quote_qty) if quote_qty else 0)
+            raw_premiums.append(raw_premium)
+        
+        # Detect if premiums are in base currency vs USDT
+        # Heuristic: If average premium is much less than 1 USDT, it's likely in base currency
+        avg_raw_premium = sum(raw_premiums) / len(raw_premiums) if raw_premiums else 0
+        is_base_currency = False
+        if spot_price > 0 and avg_raw_premium > 0:
+            # If avg premium < 0.1% of spot price, it's likely in base currency
+            # Example: 0.5 BTC × $80,000 = $40,000 → but raw = 0.5 which is << spot
+            if avg_raw_premium < spot_price * 0.001:
+                is_base_currency = True
+                logger.debug(
+                    f"Detected base-currency quoteQty for {underlying}: "
+                    f"avg_raw={avg_raw_premium:.4f}, spot={spot_price:.2f} → "
+                    f"converting to USDT (factor={spot_price:.2f})"
+                )
+        
+        for i, trade in enumerate(underlying_trades):
+            raw_premium = raw_premiums[i]
             
-            # For USDT-margined options, no conversion needed - already in USDT
-            premium_usd = quote_qty
+            # Convert from base currency to USDT if needed
+            if is_base_currency and spot_price > 0:
+                premium_usd = raw_premium * spot_price
+            else:
+                premium_usd = raw_premium
             
             total_premium_usd += premium_usd
             
@@ -1052,6 +1131,64 @@ class OptionsFetcher:
         
         return whale_score
     
+    
+    def _extract_nearest_expiry(self, option_symbols: List[Dict[str, Any]]) -> Optional[datetime]:
+        """
+        Extract the nearest expiry date from option symbol info.
+        
+        BUG FIX (Bug #5): This method was added so that OptionsChain.expiry is
+        populated, enabling gamma_exposure.py to calculate real DTE instead of
+        always defaulting to 7.0 days.
+        
+        The Binance exchange info contains expiryDate (millis timestamp) for each
+        option symbol. We find the nearest future expiry across all symbols.
+        
+        Args:
+            option_symbols: List of option symbol info dicts from exchange info
+            
+        Returns:
+            Nearest expiry datetime, or None if no valid expiry found
+        """
+        now = datetime.utcnow()
+        nearest_expiry = None
+        
+        for opt in option_symbols:
+            # Try expiryDate field (millis timestamp from exchange info)
+            expiry_ms = opt.get("expiryDate") or opt.get("expiry_date")
+            if expiry_ms:
+                try:
+                    expiry_ts = int(expiry_ms) / 1000 if int(expiry_ms) > 1e12 else int(expiry_ms)
+                    expiry_dt = datetime.utcfromtimestamp(expiry_ts)
+                    # Only consider future expiries
+                    if expiry_dt > now:
+                        if nearest_expiry is None or expiry_dt < nearest_expiry:
+                            nearest_expiry = expiry_dt
+                except (ValueError, TypeError, OSError):
+                    continue
+            
+            # Fallback: Parse expiry from symbol name (e.g., "BTC-260626-42000-C")
+            symbol = opt.get("symbol", "")
+            parts = symbol.split("-")
+            if len(parts) >= 3:
+                date_str = parts[1]  # e.g., "260626" = June 26, 2026
+                try:
+                    if len(date_str) == 6 and date_str.isdigit():
+                        day = int(date_str[0:2])
+                        month = int(date_str[2:4])
+                        year = 2000 + int(date_str[4:6])
+                        expiry_dt = datetime(year, month, day)
+                        if expiry_dt > now:
+                            if nearest_expiry is None or expiry_dt < nearest_expiry:
+                                nearest_expiry = expiry_dt
+                except (ValueError, TypeError):
+                    continue
+        
+        if nearest_expiry:
+            logger.debug(f"Extracted nearest expiry: {nearest_expiry.isoformat()}")
+        else:
+            logger.debug("No valid future expiry found in option symbols")
+        
+        return nearest_expiry
     
     def _calc_pcr_extremeness(self, pcr: float) -> float:
         """

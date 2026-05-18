@@ -231,6 +231,20 @@ class FuturesFetcher:
             result.mark_price = mark_data.get("mark_price", 0)
             result.index_price = mark_data.get("index_price", 0)
         
+        # BUG FIX (Bug #2): Fetch OI change percentage to populate the new field.
+        # Previously, FuturesData.open_interest_change_pct didn't exist, causing
+        # orchestrator.py's hasattr() to always return False → OI flow signal (12% weight) was dead.
+        try:
+            oi_stats = await self.get_oi_statistics(symbol, period="1d", limit=2)
+            if len(oi_stats) >= 2:
+                latest_oi = float(oi_stats[-1].get("sum_open_interest", 0))
+                prev_oi = float(oi_stats[0].get("sum_open_interest", 0))
+                if prev_oi > 0:
+                    result.open_interest_change_pct = (latest_oi - prev_oi) / prev_oi * 100
+        except Exception as e:
+            logger.debug(f"Failed to fetch OI change for {symbol}: {e}")
+            # open_interest_change_pct stays at default 0.0
+        
         return result
     
     async def get_open_interest(self, symbol: str) -> Dict[str, Any]:

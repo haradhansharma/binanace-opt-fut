@@ -501,22 +501,26 @@ class SentimentAnalyzer:
                 is_contrarian = True
                 confidence = min((position_ratio - 1.0) / self.config.contrarian_extreme_threshold, 0.8)
                 
-                # BUG FIX: Trend-aware adjustment for extreme contrarian signals
-                # If price is dropping and contrarian says SHORT → trend confirms → boost
+                # BUG FIX (Bug #1): Trend-aware adjustment for extreme contrarian signals
+                # Previously, the penalty block ran UNCONDITIONALLY even after a trend-confirming
+                # boost, effectively nullifying it. Now using elif so penalty only applies when
+                # trend opposes the signal.
                 if has_trend and price_dropping and signal == SignalDirection.SHORT:
+                    # Price dropping confirms contrarian SHORT → boost confidence
                     confidence = min(confidence * 1.2, 0.85)
                     logger.debug(
                         f"Sentiment: Extreme long positioning contrarian SHORT confirmed by "
                         f"price dropping ({price_change_pct:.2f}%) → boosted confidence"
                     )
-                # If price is rising and contrarian says SHORT → trend opposes → reduce
-                # FIX: Scale penalty with trend strength instead of flat 0.6
-                penalty = max(0.3, 1.0 - abs(price_change_pct) * 0.5)
-                confidence *= penalty
-                logger.debug(
-                    f"Sentiment: Extreme long positioning contrarian SHORT opposed by "
-                    f"price rising ({price_change_pct:.2f}%) → reduced confidence"
-                )
+                elif has_trend and price_rising:
+                    # Price rising opposes contrarian SHORT → reduce confidence
+                    # Scale penalty with trend strength instead of flat 0.6
+                    penalty = max(0.3, 1.0 - abs(price_change_pct) * 0.5)
+                    confidence *= penalty
+                    logger.debug(
+                        f"Sentiment: Extreme long positioning contrarian SHORT opposed by "
+                        f"price rising ({price_change_pct:.2f}%) → reduced confidence"
+                    )
                 
                 return signal, round(confidence, 3), is_contrarian
             
@@ -526,22 +530,25 @@ class SentimentAnalyzer:
                 is_contrarian = True
                 confidence = min((1.0 / position_ratio - 1.0) / self.config.contrarian_extreme_threshold, 0.8)
                 
-                # BUG FIX: Trend-aware adjustment
-                # If price is rising and contrarian says LONG → trend confirms → boost
+                # BUG FIX (Bug #1): Trend-aware adjustment (same fix as contrarian SHORT)
+                # Previously, the penalty block ran UNCONDITIONALLY even after a trend-confirming
+                # boost. Now using elif so penalty only applies when trend opposes.
                 if has_trend and price_rising and signal == SignalDirection.LONG:
+                    # Price rising confirms contrarian LONG → boost confidence
                     confidence = min(confidence * 1.2, 0.85)
                     logger.debug(
                         f"Sentiment: Extreme short positioning contrarian LONG confirmed by "
                         f"price rising ({price_change_pct:.2f}%) → boosted confidence"
                     )
-                # If price is dropping and contrarian says LONG → trend opposes → reduce
-                # FIX: Scale penalty with trend strength instead of flat 0.6
-                penalty = max(0.3, 1.0 - abs(price_change_pct) * 0.5)
-                confidence *= penalty
-                logger.debug(
-                    f"Sentiment: Extreme short positioning contrarian LONG opposed by "
-                    f"price dropping ({price_change_pct:.2f}%) → reduced confidence"
-                )
+                elif has_trend and price_dropping:
+                    # Price dropping opposes contrarian LONG → reduce confidence
+                    # Scale penalty with trend strength instead of flat 0.6
+                    penalty = max(0.3, 1.0 - abs(price_change_pct) * 0.5)
+                    confidence *= penalty
+                    logger.debug(
+                        f"Sentiment: Extreme short positioning contrarian LONG opposed by "
+                        f"price dropping ({price_change_pct:.2f}%) → reduced confidence"
+                    )
                 
                 return signal, round(confidence, 3), is_contrarian
             
