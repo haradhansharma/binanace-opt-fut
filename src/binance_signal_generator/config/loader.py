@@ -31,13 +31,13 @@ logger = get_logger(__name__)
 def load_env_file(env_path: Optional[str] = None) -> None:
     """
     Load environment variables from .env file.
-    
+
     Searches for .env file in the following order:
     1. Specified env_path
     2. ./env (current directory)
     3. ./.env (current directory)
     4. Parent directories (walking up)
-    
+
     Args:
         env_path: Optional path to .env file
     """
@@ -46,20 +46,20 @@ def load_env_file(env_path: Optional[str] = None) -> None:
         load_dotenv(env_path, override=True)
         logger.debug(f"Loaded environment from: {env_path}")
         return
-    
+
     # Search for .env file
     search_paths = [
         Path.cwd() / ".env",
         Path.cwd() / "env",
         Path.cwd().parent / ".env",
     ]
-    
+
     for path in search_paths:
         if path.exists():
             load_dotenv(path, override=True)
             logger.debug(f"Loaded environment from: {path}")
             return
-    
+
     # Try default dotenv behavior (searches current and parent directories)
     load_dotenv(override=True)
 
@@ -71,44 +71,43 @@ ENV_PATTERN = re.compile(r"\$\{([^}:]+)(?::([^}]*))?\}")
 def substitute_env_variables(value: Any) -> Any:
     """
     Recursively substitute environment variables in configuration values.
-    
+
     Supports:
     - ${VAR_NAME} - Required, raises error if not set
     - ${VAR_NAME:default} - Optional, uses default if not set
-    
+
     Args:
         value: Configuration value (can be str, dict, list, etc.)
-        
+
     Returns:
         Value with environment variables substituted
-        
+
     Raises:
         MissingConfigError: If required environment variable is not set
     """
     if isinstance(value, str):
+
         def replace_env(match):
             var_name = match.group(1)
             default = match.group(2)
-            
+
             env_value = os.environ.get(var_name)
-            
+
             if env_value is not None:
                 return env_value
             elif default is not None:
                 return default
             else:
-                raise MissingConfigError(
-                    f"Required environment variable '{var_name}' is not set"
-                )
-        
+                raise MissingConfigError(f"Required environment variable '{var_name}' is not set")
+
         return ENV_PATTERN.sub(replace_env, value)
-    
+
     elif isinstance(value, dict):
         return {k: substitute_env_variables(v) for k, v in value.items()}
-    
+
     elif isinstance(value, list):
         return [substitute_env_variables(item) for item in value]
-    
+
     else:
         return value
 
@@ -116,6 +115,7 @@ def substitute_env_variables(value: Any) -> Any:
 @dataclass
 class BinanceConfig:
     """Binance API configuration."""
+
     api_key: str = ""
     api_secret: str = ""
     testnet: bool = False
@@ -128,9 +128,10 @@ class BinanceConfig:
 @dataclass
 class RankingConfig:
     """Asset ranking configuration."""
+
     top_assets_count: int = 5
     min_activity_score: float = 0.30
-    
+
     # Scoring weights
     weight_oi_change: float = 0.25
     weight_volume_spike: float = 0.20
@@ -138,12 +139,12 @@ class RankingConfig:
     weight_pcr_extreme: float = 0.15
     weight_whale_activity: float = 0.15
     weight_total_volume: float = 0.10
-    
+
     # Thresholds
     oi_change_max_pct: float = 20.0
     volume_spike_max: float = 5.0
     total_volume_max: float = 100_000_000
-    
+
     # Liquidity requirements
     # BUG FIX (Bug #15): Lowered defaults to match config.yaml recommendations.
     # Previously, defaults were $5M / 10 strikes, which rejected most Binance
@@ -152,7 +153,7 @@ class RankingConfig:
     # through while still filtering out completely illiquid ones.
     min_options_volume: float = 100_000  # $100K minimum (lowered from $5M)
     min_active_strikes: int = 5  # Lowered from 10
-    
+
     # Exclusions
     excluded_symbols: list = field(default_factory=list)
 
@@ -160,6 +161,7 @@ class RankingConfig:
 @dataclass
 class PipelineConfig:
     """Pipeline execution configuration."""
+
     timeout_total_seconds: int = 600
     timeout_activity_scan_seconds: int = 30
     timeout_asset_selection_seconds: int = 10
@@ -172,24 +174,25 @@ class PipelineConfig:
 @dataclass
 class IntradayConfig:
     """Intraday data configuration for 15-min trading system."""
+
     # Enable intraday mode
     enabled: bool = True
-    
+
     # Intraday OI settings
     oi_period: str = "15m"  # For intraday OI momentum
     oi_limit: int = 96  # 24 hours of 15-min data
-    
+
     # Intraday volume settings
     volume_interval: str = "15m"  # For volume spike detection
     volume_limit: int = 48  # 12 hours for avg comparison
-    
+
     # Price action settings
     kline_interval: str = "15m"
     kline_limit: int = 48  # 12 hours of candles
-    
+
     # Scoring mode: "intraday" uses shorter timeframes, "daily" uses daily data
     scoring_mode: str = "intraday"
-    
+
     # Execution interval in minutes
     execution_interval_minutes: int = 15
 
@@ -197,6 +200,7 @@ class IntradayConfig:
 @dataclass
 class AssetWhaleThreshold:
     """Asset-specific whale detection thresholds."""
+
     min_premium: float = 100_000
     block_threshold: float = 500_000
 
@@ -204,6 +208,7 @@ class AssetWhaleThreshold:
 @dataclass
 class WhaleConfig:
     """Whale detection configuration."""
+
     min_premium: float = 100_000  # Default threshold
     block_threshold: float = 500_000  # Default block threshold
     lookback_hours: int = 24
@@ -217,6 +222,7 @@ class WhaleConfig:
 @dataclass
 class WallsConfig:
     """Wall detection configuration."""
+
     min_oi_percentage: float = 0.15
     major_threshold: float = 0.25
     max_levels: int = 3
@@ -225,15 +231,49 @@ class WallsConfig:
 
 
 @dataclass
+class SentimentConfig:
+    """Sentiment analysis configuration (L/S Ratios + Funding Rate)."""
+
+    enabled: bool = True
+    weight: float = 0.20
+
+    # L/S Ratio thresholds
+    ls_ratio_extreme_high: float = 2.0
+    ls_ratio_extreme_low: float = 0.5
+    ls_ratio_bullish: float = 1.2
+    ls_ratio_bearish: float = 0.8
+
+    # Funding rate thresholds (in decimal)
+    funding_extreme_high: float = 0.0005
+    funding_extreme_low: float = -0.0005
+    funding_bullish: float = 0.0001
+    funding_bearish: float = -0.0001
+
+    # Lookback periods
+    ls_ratio_lookback_periods: int = 5
+    funding_rate_lookback_hours: int = 168
+
+    # Weights for combined sentiment
+    top_trader_position_weight: float = 0.35
+    top_trader_account_weight: float = 0.25
+    funding_rate_weight: float = 0.40
+
+    # Contrarian mode
+    use_contrarian_signals: bool = True
+    contrarian_extreme_threshold: float = 3.0
+
+
+@dataclass
 class AnalysisConfig:
     """Options analysis configuration."""
+
     # IV
     iv_enabled: bool = True
     iv_weight: float = 0.20
     iv_lookback_days: int = 30
     iv_threshold_high: float = 0.75
     iv_threshold_low: float = 0.25
-    
+
     # PCR
     pcr_enabled: bool = True
     pcr_weight: float = 0.25
@@ -241,69 +281,95 @@ class AnalysisConfig:
     pcr_threshold_call_high: float = 0.8
     pcr_volume_weight: float = 0.6
     pcr_oi_weight: float = 0.4
-    
+
     # OI
     oi_enabled: bool = True
     oi_weight: float = 0.20
     oi_concentration_threshold: float = 0.15
-    
+
     # Max Pain
     max_pain_enabled: bool = True
     max_pain_weight: float = 0.15
     max_pain_distance_threshold: float = 2.0
 
+    # Sentiment
+    sentiment: SentimentConfig = field(default_factory=SentimentConfig)
+
 
 @dataclass
 class ValidationConfig:
     """Futures validation configuration."""
+
     liquidity_enabled: bool = True
     liquidity_min_24h_volume: float = 1_000_000
-    
+
     trend_enabled: bool = True
     trend_ema_fast: int = 9
     trend_ema_slow: int = 21
     trend_require_alignment: bool = True
-    
+
     volatility_enabled: bool = True
     volatility_atr_period: int = 14
     volatility_extreme_multiplier: float = 3.0
-    
+
     funding_enabled: bool = True
     funding_max_absolute_rate: float = 0.001
 
 
 @dataclass
+class StopLossWallBasedConfig:
+    """Wall-based stop loss configuration."""
+
+    use_nearest_wall: bool = True
+    buffer_pct: float = 0.2
+
+
+@dataclass
+class TakeProfitWallBasedConfig:
+    """Wall-based take profit configuration."""
+
+    tp1: str = "nearest_wall"
+    tp2: str = "second_wall"
+    tp3: str = "third_wall"
+
+
+@dataclass
 class OutputConfig:
     """Signal output configuration."""
+
     # JSON output
     json_enabled: bool = True
     json_pretty_print: bool = False
     json_include_metadata: bool = True
     json_include_selected_assets: bool = True
-    
+
     # Signal filtering
     min_confidence: float = 0.55
     max_per_asset: int = 1
     max_per_execution: int = 5
     min_risk_reward: float = 1.5
-    
+
     # S/R levels
     sr_max_levels: int = 3
     sr_include_max_pain: bool = True
     sr_min_wall_strength: float = 0.50
-    
+
     # Stop loss
     stop_loss_method: str = "wall"
+    stop_loss_wall_based: StopLossWallBasedConfig = field(default_factory=StopLossWallBasedConfig)
     stop_loss_buffer_pct: float = 0.2
     stop_loss_min_distance_pct: float = 0.5
     stop_loss_max_distance_pct: float = 3.0
-    
+
     # Take profit
     take_profit_levels: int = 3
     take_profit_ratio_1: float = 0.5
     take_profit_ratio_2: float = 0.3
     take_profit_ratio_3: float = 0.2
-    
+    take_profit_wall_based: TakeProfitWallBasedConfig = field(
+        default_factory=TakeProfitWallBasedConfig
+    )
+
     # Database
     database_enabled: bool = True
     database_path: str = "./data/signals.db"
@@ -314,6 +380,7 @@ class OutputConfig:
 @dataclass
 class LoggingConfig:
     """Logging configuration."""
+
     level: str = "INFO"
     format: str = "json"
     file_enabled: bool = True
@@ -329,10 +396,11 @@ class LoggingConfig:
 class Config:
     """
     Main configuration class containing all settings.
-    
+
     This class holds all configuration for the signal generator,
     organized into logical sections.
     """
+
     binance: BinanceConfig = field(default_factory=BinanceConfig)
     ranking: RankingConfig = field(default_factory=RankingConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
@@ -343,92 +411,92 @@ class Config:
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
-    
+
     # Path to the config file that was loaded
     config_path: Optional[str] = None
-    
+
     @classmethod
     def from_yaml(cls, path: str) -> "Config":
         """
         Load configuration from a YAML file.
-        
+
         Args:
             path: Path to the YAML configuration file
-            
+
         Returns:
             Config object with loaded settings
-            
+
         Raises:
             ConfigurationError: If configuration is invalid
             FileNotFoundError: If config file doesn't exist
         """
         config_path = Path(path)
-        
+
         if not config_path.exists():
             raise FileNotFoundError(f"Configuration file not found: {path}")
-        
+
         logger.info(f"Loading configuration from {path}")
-        
+
         try:
             with open(config_path, "r") as f:
                 raw_config = yaml.safe_load(f)
         except yaml.YAMLError as e:
             raise ConfigurationError(f"Failed to parse YAML: {e}")
-        
+
         if not raw_config:
             raise ConfigurationError("Empty configuration file")
-        
+
         # Substitute environment variables
         config_data = substitute_env_variables(raw_config)
-        
+
         # Build config object
         return cls._build_config(config_data, str(config_path))
-    
+
     @classmethod
     def _build_config(cls, data: Dict[str, Any], config_path: str) -> "Config":
         """Build Config object from parsed YAML data."""
         config = cls()
         config.config_path = config_path
-        
+
         # Parse each section
         if "binance" in data:
             config.binance = cls._parse_binance(data["binance"])
-        
+
         if "ranking" in data:
             config.ranking = cls._parse_ranking(data["ranking"])
-        
+
         if "pipeline" in data:
             config.pipeline = cls._parse_pipeline(data["pipeline"])
-        
+
         if "intraday" in data:
             config.intraday = cls._parse_intraday(data["intraday"])
-        
+
         if "whale" in data:
             config.whale = cls._parse_whale(data["whale"])
-        
+
         if "walls" in data:
             config.walls = cls._parse_walls(data["walls"])
-        
+
         if "analysis" in data:
             config.analysis = cls._parse_analysis(data["analysis"])
-        
+
         if "validation" in data:
             config.validation = cls._parse_validation(data["validation"])
-        
+
         if "output" in data:
             config.output = cls._parse_output(data["output"])
-        
+
         if "logging" in data:
             config.logging = cls._parse_logging(data["logging"])
-        
+
         return config
-    
+
     @staticmethod
     def _parse_binance(data: Dict) -> BinanceConfig:
         """Parse binance section."""
         rate_limit = data.get("rate_limit", {})
         timeout = data.get("timeout", {})
-        
+
         return BinanceConfig(
             api_key=data.get("api_key", ""),
             api_secret=data.get("api_secret", ""),
@@ -438,13 +506,13 @@ class Config:
             timeout_connect_seconds=timeout.get("connect_seconds", 10),
             timeout_read_seconds=timeout.get("read_seconds", 30),
         )
-    
+
     @staticmethod
     def _parse_ranking(data: Dict) -> RankingConfig:
         """Parse ranking section."""
         weights = data.get("scoring_weights", {})
         thresholds = data.get("thresholds", {})
-        
+
         return RankingConfig(
             top_assets_count=data.get("top_assets_count", 5),
             min_activity_score=data.get("min_activity_score", 0.30),
@@ -457,16 +525,20 @@ class Config:
             oi_change_max_pct=thresholds.get("oi_change_max_pct", 20.0),
             volume_spike_max=thresholds.get("volume_spike_max", 5.0),
             total_volume_max=thresholds.get("total_volume_max", 100_000_000),
-            min_options_volume=data.get("min_options_volume", 100_000),  # BUG FIX (Bug #15): Lowered default from $5M
-            min_active_strikes=data.get("min_active_strikes", 5),  # BUG FIX (Bug #15): Lowered default from 10
+            min_options_volume=data.get(
+                "min_options_volume", 100_000
+            ),  # BUG FIX (Bug #15): Lowered default from $5M
+            min_active_strikes=data.get(
+                "min_active_strikes", 5
+            ),  # BUG FIX (Bug #15): Lowered default from 10
             excluded_symbols=data.get("excluded_symbols", []),
         )
-    
+
     @staticmethod
     def _parse_pipeline(data: Dict) -> PipelineConfig:
         """Parse pipeline section."""
         timeout = data.get("timeout", {})
-        
+
         return PipelineConfig(
             timeout_total_seconds=timeout.get("total_seconds", 600),
             timeout_activity_scan_seconds=timeout.get("activity_scan_seconds", 30),
@@ -476,7 +548,7 @@ class Config:
             timeout_whale_wall_seconds=timeout.get("whale_wall_seconds", 60),
             timeout_signal_output_seconds=timeout.get("signal_output_seconds", 60),
         )
-    
+
     @staticmethod
     def _parse_intraday(data: Dict) -> IntradayConfig:
         """Parse intraday section."""
@@ -491,12 +563,12 @@ class Config:
             scoring_mode=data.get("scoring_mode", "intraday"),
             execution_interval_minutes=data.get("execution_interval_minutes", 15),
         )
-    
+
     @staticmethod
     def _parse_whale(data: Dict) -> WhaleConfig:
         """Parse whale section."""
         boost = data.get("confidence_boost", {})
-        
+
         # Parse asset-specific thresholds
         asset_thresholds = {}
         for asset, thresholds in data.get("asset_thresholds", {}).items():
@@ -504,7 +576,7 @@ class Config:
                 min_premium=thresholds.get("min_premium", 100_000),
                 block_threshold=thresholds.get("block_threshold", 500_000),
             )
-        
+
         return WhaleConfig(
             min_premium=data.get("min_premium", 100_000),
             block_threshold=data.get("block_threshold", 500_000),
@@ -514,12 +586,12 @@ class Config:
             confidence_boost_net_volume_threshold=boost.get("net_volume_threshold", 20_000_000),
             asset_thresholds=asset_thresholds,
         )
-    
+
     @staticmethod
     def _parse_walls(data: Dict) -> WallsConfig:
         """Parse walls section."""
         strength = data.get("strength", {})
-        
+
         return WallsConfig(
             min_oi_percentage=data.get("min_oi_percentage", 0.15),
             major_threshold=data.get("major_threshold", 0.25),
@@ -527,7 +599,7 @@ class Config:
             strength_distance_factor=strength.get("distance_factor", 0.30),
             strength_oi_factor=strength.get("oi_factor", 0.70),
         )
-    
+
     @staticmethod
     def _parse_analysis(data: Dict) -> AnalysisConfig:
         """Parse analysis section."""
@@ -535,7 +607,28 @@ class Config:
         pcr = data.get("pcr", {})
         oi = data.get("oi", {})
         max_pain = data.get("max_pain", {})
-        
+        sentiment = data.get("sentiment", {})
+
+        sentiment_config = SentimentConfig(
+            enabled=sentiment.get("enabled", True),
+            weight=sentiment.get("weight", 0.20),
+            ls_ratio_extreme_high=sentiment.get("ls_ratio_extreme_high", 2.0),
+            ls_ratio_extreme_low=sentiment.get("ls_ratio_extreme_low", 0.5),
+            ls_ratio_bullish=sentiment.get("ls_ratio_bullish", 1.2),
+            ls_ratio_bearish=sentiment.get("ls_ratio_bearish", 0.8),
+            funding_extreme_high=sentiment.get("funding_extreme_high", 0.0005),
+            funding_extreme_low=sentiment.get("funding_extreme_low", -0.0005),
+            funding_bullish=sentiment.get("funding_bullish", 0.0001),
+            funding_bearish=sentiment.get("funding_bearish", -0.0001),
+            ls_ratio_lookback_periods=sentiment.get("ls_ratio_lookback_periods", 5),
+            funding_rate_lookback_hours=sentiment.get("funding_rate_lookback_hours", 168),
+            top_trader_position_weight=sentiment.get("top_trader_position_weight", 0.35),
+            top_trader_account_weight=sentiment.get("top_trader_account_weight", 0.25),
+            funding_rate_weight=sentiment.get("funding_rate_weight", 0.40),
+            use_contrarian_signals=sentiment.get("use_contrarian_signals", True),
+            contrarian_extreme_threshold=sentiment.get("contrarian_extreme_threshold", 3.0),
+        )
+
         return AnalysisConfig(
             iv_enabled=iv.get("enabled", True),
             iv_weight=iv.get("weight", 0.20),
@@ -554,8 +647,9 @@ class Config:
             max_pain_enabled=max_pain.get("enabled", True),
             max_pain_weight=max_pain.get("weight", 0.15),
             max_pain_distance_threshold=max_pain.get("distance_threshold", 2.0),
+            sentiment=sentiment_config,
         )
-    
+
     @staticmethod
     def _parse_validation(data: Dict) -> ValidationConfig:
         """Parse validation section."""
@@ -563,7 +657,7 @@ class Config:
         trend = data.get("trend", {})
         volatility = data.get("volatility", {})
         funding = data.get("funding", {})
-        
+
         return ValidationConfig(
             liquidity_enabled=liquidity.get("enabled", True),
             liquidity_min_24h_volume=liquidity.get("min_24h_volume", 1_000_000),
@@ -577,7 +671,7 @@ class Config:
             funding_enabled=funding.get("enabled", True),
             funding_max_absolute_rate=funding.get("max_absolute_rate", 0.001),
         )
-    
+
     @staticmethod
     def _parse_output(data: Dict) -> OutputConfig:
         """Parse output section."""
@@ -588,7 +682,9 @@ class Config:
         tp = data.get("take_profit", {})
         db = data.get("database", {})
         ratios = tp.get("ratios", {})
-        
+        sl_wall = sl.get("wall_based", {})
+        tp_wall = tp.get("wall_based", {})
+
         return OutputConfig(
             json_enabled=json_cfg.get("enabled", True),
             json_pretty_print=json_cfg.get("pretty_print", False),
@@ -602,6 +698,10 @@ class Config:
             sr_include_max_pain=sr.get("include_max_pain", True),
             sr_min_wall_strength=sr.get("min_wall_strength", 0.50),
             stop_loss_method=sl.get("method", "wall"),
+            stop_loss_wall_based=StopLossWallBasedConfig(
+                use_nearest_wall=sl_wall.get("use_nearest_wall", True),
+                buffer_pct=sl_wall.get("buffer_pct", 0.2),
+            ),
             stop_loss_buffer_pct=sl.get("wall_based", {}).get("buffer_pct", 0.2),
             stop_loss_min_distance_pct=sl.get("min_distance_pct", 0.5),
             stop_loss_max_distance_pct=sl.get("max_distance_pct", 3.0),
@@ -609,18 +709,23 @@ class Config:
             take_profit_ratio_1=ratios.get("level_1", 0.5),
             take_profit_ratio_2=ratios.get("level_2", 0.3),
             take_profit_ratio_3=ratios.get("level_3", 0.2),
+            take_profit_wall_based=TakeProfitWallBasedConfig(
+                tp1=tp_wall.get("tp1", "nearest_wall"),
+                tp2=tp_wall.get("tp2", "second_wall"),
+                tp3=tp_wall.get("tp3", "third_wall"),
+            ),
             database_enabled=db.get("enabled", True),
             database_path=db.get("path", "./data/signals.db"),
             database_rotation=db.get("rotation", "weekly"),
             database_retention_weeks=db.get("retention_weeks", 4),
         )
-    
+
     @staticmethod
     def _parse_logging(data: Dict) -> LoggingConfig:
         """Parse logging section."""
         file = data.get("file", {})
         console = data.get("console", {})
-        
+
         return LoggingConfig(
             level=data.get("level", "INFO"),
             format=data.get("format", "json"),
@@ -637,60 +742,62 @@ class Config:
 def load_config(config_path: Optional[str] = None, env_path: Optional[str] = None) -> Config:
     """
     Load configuration with fallbacks.
-    
+
     Automatically loads environment variables from .env file before processing.
-    
+
     Priority for config file:
     1. Specified path
     2. ./config.yaml
     3. ./config/config.yaml
     4. Environment variable BINANCE_SIGNAL_CONFIG
-    
+
     Priority for .env file:
     1. Specified env_path
     2. ./.env in current directory
     3. Parent directories
-    
+
     Args:
         config_path: Optional path to configuration file
         env_path: Optional path to .env file
-        
+
     Returns:
         Config object
-        
+
     Raises:
         ConfigurationError: If no config file found
     """
     # Load environment variables from .env file first
     load_env_file(env_path)
-    
+
     search_paths = []
-    
+
     if config_path:
         search_paths.append(config_path)
-    
-    search_paths.extend([
-        "./config.yaml",
-        "./config/config.yaml",
-        "~/binance-signal-generator/config.yaml",
-    ])
-    
+
+    search_paths.extend(
+        [
+            "./config.yaml",
+            "./config/config.yaml",
+            "~/binance-signal-generator/config.yaml",
+        ]
+    )
+
     # Check environment variable
     env_config_path = os.environ.get("BINANCE_SIGNAL_CONFIG")
     if env_config_path:
         search_paths.insert(0, env_config_path)
-    
+
     for path in search_paths:
         expanded_path = Path(path).expanduser()
         if expanded_path.exists():
             return Config.from_yaml(str(expanded_path))
-    
+
     # Return default config with environment variables if no file found
     logger.warning("No configuration file found, using defaults")
     config = Config()
-    
+
     # Read API credentials from environment variables
     config.binance.api_key = os.environ.get("BINANCE_API_KEY", "")
     config.binance.api_secret = os.environ.get("BINANCE_API_SECRET", "")
-    
+
     return config

@@ -101,7 +101,7 @@ logs/
 # Environment / secrets
 .env
 .env.*
-config/*.local.*
+
 
 # IDE / editor directories
 .vscode/
@@ -116,3 +116,4 @@ data/*.tmp
 
 download.py
 godaddy1.csv
+config.yaml.bak
