@@ -113,3 +113,6 @@ config/*.local.*
 
 # Generated data
 data/*.tmp
+
+download.py
+godaddy1.csv
