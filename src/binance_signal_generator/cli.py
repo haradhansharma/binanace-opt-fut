@@ -7,16 +7,16 @@ generation pipeline from the command line.
 Usage:
     # Run with default config (adaptive asset selection)
     python -m binance_signal_generator
-    
+
     # Run with custom config
     python -m binance_signal_generator --config /path/to/config.yaml
-    
+
     # Run for specific symbols
     python -m binance_signal_generator --symbols BTCUSDT ETHUSDT
-    
+
     # Dry run (no database)
     python -m binance_signal_generator --dry-run
-    
+
     # Pretty print output
     python -m binance_signal_generator --pretty
 """
@@ -31,7 +31,7 @@ from typing import Optional, List
 from binance_signal_generator import __version__
 from binance_signal_generator.config.loader import load_config, Config
 from binance_signal_generator.config.validators import ensure_valid_config
-from binance_signal_generator.pipeline.orchestrator import PipelineOrchestrator, PipelineConfig
+from binance_signal_generator.pipeline.orchestrator import PipelineOrchestrator
 from binance_signal_generator.output.json_output import JSONOutput, get_output_summary
 from binance_signal_generator.utils.exceptions import SignalGeneratorError, PipelineError
 from binance_signal_generator.utils.logging import setup_logging, get_logger
@@ -70,27 +70,28 @@ Examples:
   python -m binance_signal_generator --compact
         """,
     )
-    
+
     parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
     )
-    
+
     parser.add_argument(
-        "-c", "--config",
+        "-c",
+        "--config",
         type=str,
         default=None,
         metavar="PATH",
         help="Path to configuration file (default: ./config.yaml or env BINANCE_SIGNALS_CONFIG)",
     )
-    
+
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run without saving to database",
     )
-    
+
     parser.add_argument(
         "--symbols",
         type=str,
@@ -98,38 +99,40 @@ Examples:
         metavar="SYMBOL",
         help="Specific symbols to analyze (bypasses adaptive selection)",
     )
-    
+
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="count",
         default=0,
         help="Increase verbosity (can be used multiple times: -v, -vv)",
     )
-    
+
     parser.add_argument(
-        "-q", "--quiet",
+        "-q",
+        "--quiet",
         action="store_true",
         help="Suppress all output except signals (errors go to stderr)",
     )
-    
+
     parser.add_argument(
         "--pretty",
         action="store_true",
         help="Pretty print JSON output with indentation",
     )
-    
+
     parser.add_argument(
         "--compact",
         action="store_true",
         help="Output one signal per line (compact format)",
     )
-    
+
     parser.add_argument(
         "--validate-config",
         action="store_true",
         help="Validate configuration and exit",
     )
-    
+
     parser.add_argument(
         "--output",
         type=str,
@@ -137,7 +140,7 @@ Examples:
         metavar="PATH",
         help="Write output to file instead of stdout",
     )
-    
+
     parser.add_argument(
         "--top-n",
         type=int,
@@ -145,7 +148,7 @@ Examples:
         metavar="N",
         help="Number of top assets to analyze (default: 5)",
     )
-    
+
     parser.add_argument(
         "--min-confidence",
         type=float,
@@ -153,7 +156,7 @@ Examples:
         metavar="SCORE",
         help="Minimum signal confidence to output (default: 0.30)",
     )
-    
+
     parser.add_argument(
         "--min-activity",
         type=float,
@@ -161,23 +164,23 @@ Examples:
         metavar="SCORE",
         help="Minimum activity score for asset selection (default: 0.15)",
     )
-    
+
     return parser
 
 
 def setup_verbosity(args: argparse.Namespace) -> str:
     """
     Determine log level from verbosity arguments.
-    
+
     Args:
         args: Parsed arguments
-        
+
     Returns:
         Log level string
     """
     if args.quiet:
         return "ERROR"
-    
+
     if args.verbose >= 2:
         return "DEBUG"
     elif args.verbose >= 1:
@@ -196,42 +199,38 @@ async def run_pipeline(
 ) -> ExecutionResult:
     """
     Run the signal generation pipeline.
-    
+
     Args:
         config: Configuration object
         symbols: Optional list of specific symbols to analyze
         dry_run: If True, don't save to database
-        top_n: Number of top assets to analyze
-        min_confidence: Minimum signal confidence
-        min_activity: Minimum activity score for asset selection
-        
+        top_n: Number of top assets to analyze (overrides config)
+        min_confidence: Minimum signal confidence (overrides config)
+        min_activity: Minimum activity score for asset selection (overrides config)
+
     Returns:
         ExecutionResult with generated signals
     """
-    # Create pipeline configuration
-    pipeline_config = PipelineConfig(
-        top_n_assets=top_n,
-        min_activity_score=min_activity,
-        min_signal_confidence=min_confidence,
-        save_to_database=not dry_run,
-    )
-    
-    # Initialize orchestrator
-    orchestrator = PipelineOrchestrator(
-        config=config,
-        pipeline_config=pipeline_config,
-    )
-    
+    # Override config values with CLI arguments if provided
+    # The orchestrator uses config.orchestrator for these settings
+    config.orchestrator.top_n_assets = top_n
+    config.orchestrator.min_activity_score = min_activity
+    config.orchestrator.min_signal_confidence = min_confidence
+    config.orchestrator.save_to_database = not dry_run
+
+    # Initialize orchestrator (takes Config object, uses config.orchestrator)
+    orchestrator = PipelineOrchestrator(config=config)
+
     try:
         # Run the pipeline
         result = await orchestrator.run(symbols=symbols)
-        
+
         # Log summary
         summary = get_output_summary(result)
         logger.info("Pipeline completed", extra={"data": summary})
-        
+
         return result
-        
+
     finally:
         # Cleanup
         await orchestrator.close()
@@ -245,7 +244,7 @@ def output_result(
 ) -> None:
     """
     Output the execution result as JSON.
-    
+
     Args:
         result: Execution result to output
         pretty: If True, pretty print JSON
@@ -263,16 +262,16 @@ def output_result(
 def main(args: Optional[List[str]] = None) -> int:
     """
     Main entry point for the CLI.
-    
+
     Args:
         args: Command line arguments (default: sys.argv[1:])
-        
+
     Returns:
         Exit code (0 for success, non-zero for error)
     """
     parser = create_parser()
     parsed_args = parser.parse_args(args)
-    
+
     # Load configuration
     try:
         config = load_config(parsed_args.config)
@@ -282,16 +281,16 @@ def main(args: Optional[List[str]] = None) -> int:
     except Exception as e:
         print(f"Error loading configuration: {e}", file=sys.stderr)
         return 1
-    
+
     # Setup logging
     log_level = setup_verbosity(parsed_args)
     setup_logging(
         level=log_level,
-        log_file=config.logging.file_path if hasattr(config.logging, 'file_path') else None,
+        log_file=config.logging.file_path if hasattr(config.logging, "file_path") else None,
         console_enabled=log_level == "DEBUG",
         json_format=False,
     )
-    
+
     # Validate configuration
     if parsed_args.validate_config:
         try:
@@ -301,14 +300,14 @@ def main(args: Optional[List[str]] = None) -> int:
         except Exception as e:
             print(f"Configuration validation failed: {e}", file=sys.stderr)
             return 1
-    
+
     try:
         ensure_valid_config(config)
     except Exception as e:
         logger.error(f"Configuration validation failed: {e}")
         print(f"Error: {e}", file=sys.stderr)
         return 1
-    
+
     # Run the pipeline
     try:
         result = asyncio.run(
@@ -321,7 +320,7 @@ def main(args: Optional[List[str]] = None) -> int:
                 min_activity=parsed_args.min_activity,
             )
         )
-        
+
         # Output result
         output_result(
             result,
@@ -329,22 +328,22 @@ def main(args: Optional[List[str]] = None) -> int:
             output_file=parsed_args.output,
             compact=parsed_args.compact,
         )
-        
+
         # Return appropriate exit code
         if result.errors and not result.signals:
             return 1
         return 0
-        
+
     except SignalGeneratorError as e:
         logger.error(f"Signal generation failed: {e}")
         print(f"Error: {e}", file=sys.stderr)
         return 1
-        
+
     except KeyboardInterrupt:
         logger.info("Pipeline interrupted by user")
         print("\nInterrupted", file=sys.stderr)
         return 130
-        
+
     except Exception as e:
         logger.exception(f"Unexpected error: {e}")
         print(f"Unexpected error: {e}", file=sys.stderr)

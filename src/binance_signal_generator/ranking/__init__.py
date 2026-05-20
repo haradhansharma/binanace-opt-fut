@@ -9,14 +9,10 @@ from binance_signal_generator.ranking.activity_scorer import (
     ActivityScorer,
     ActivityScanResult,
 )
-from binance_signal_generator.ranking.asset_selector import (
-    AssetSelector,
-    SelectionConfig,
-)
+from binance_signal_generator.ranking.asset_selector import AssetSelector
 
 __all__ = [
     "ActivityScorer",
     "ActivityScanResult",
     "AssetSelector",
-    "SelectionConfig",
 ]

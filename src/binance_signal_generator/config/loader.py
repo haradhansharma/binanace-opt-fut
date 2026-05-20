@@ -264,6 +264,255 @@ class SentimentConfig:
 
 
 @dataclass
+class IVConfig:
+    """IV (Implied Volatility) analysis configuration."""
+
+    # IV percentile thresholds
+    iv_high_threshold: float = 0.75  # 75th percentile
+    iv_low_threshold: float = 0.25  # 25th percentile
+
+    # IV value thresholds (annualized)
+    iv_high_value: float = 0.80  # 80% annualized
+    iv_low_value: float = 0.30  # 30% annualized
+
+    # ATM range for IV calculation (percentage from spot)
+    atm_range_pct: float = 5.0  # 5% from spot
+
+    # Minimum strikes for valid analysis
+    min_strikes: int = 3
+
+
+@dataclass
+class PCRAnalyzerConfig:
+    """Configuration for PCR analysis (pcr_analyzer.py)."""
+
+    # PCR thresholds
+    pcr_high_threshold: float = 1.2  # Put-heavy
+    pcr_low_threshold: float = 0.8  # Call-heavy
+    pcr_extreme_high: float = 1.5  # Very put-heavy
+    pcr_extreme_low: float = 0.5  # Very call-heavy
+
+    # Weight for notional PCR vs OI PCR
+    volume_weight: float = 0.4  # 40% notional PCR, 60% OI PCR
+
+    # Minimum OI for valid analysis
+    min_total_oi: int = 100
+
+
+@dataclass
+class OIAnalyzerConfig:
+    """Configuration for OI analysis (oi_analyzer.py)."""
+
+    # OI concentration threshold (crypto-optimized)
+    high_oi_concentration: float = 0.04  # 4% of total OI at one strike
+    significant_oi_change: float = 0.20  # 20% change is significant
+
+    # Strike analysis
+    max_strikes_to_analyze: int = 50
+
+    # Minimum total OI
+    min_total_oi: int = 100
+
+
+@dataclass
+class MaxPainAnalyzerConfig:
+    """Configuration for Max Pain calculation (max_pain.py)."""
+
+    # Distance threshold for signal (percentage)
+    distance_threshold: float = 3.0  # 3% from max pain
+
+    # Magnet strength calculation
+    expiry_weight_factor: float = 1.0  # Weight by days to expiry
+
+    # Minimum strikes for calculation
+    min_strikes: int = 3
+
+
+@dataclass
+class WallDetectorAnalyzerConfig:
+    """Configuration for wall detection (wall_detector.py)."""
+
+    # OI concentration threshold (crypto-optimized)
+    min_oi_concentration: float = 0.002  # 0.2% of total OI
+
+    # Major wall threshold
+    major_wall_concentration: float = 0.01  # 1% of total OI
+
+    # Distance from spot (in %)
+    max_wall_distance: float = 15.0  # 15% from spot
+
+    # Minimum absolute OI
+    min_absolute_oi: int = 10
+
+
+@dataclass
+class GammaExposureAnalyzerConfig:
+    """Configuration for gamma exposure calculation (gamma_exposure.py)."""
+
+    # GEX significance threshold (as % of total absolute GEX)
+    significant_level_threshold: float = 0.05  # 5% of total
+
+    # Minimum OI to consider
+    min_oi_threshold: int = 10
+
+    # Price range for flip detection (% from spot)
+    flip_search_range: float = 0.30  # ±30% from spot
+
+    # Whether to use simplified delta approximation
+    use_simplified_delta: bool = True
+
+    # DTE weighting parameters
+    dte_reference_days: float = 7.0
+    max_dte_weight: float = 3.0
+    min_dte_weight: float = 0.3
+    enable_dte_weighting: bool = True
+
+
+@dataclass
+class SignalScorerAnalyzerConfig:
+    """Configuration for signal scoring (signal_scorer.py)."""
+
+    # Core weights for each signal type
+    iv_weight: float = 0.15
+    pcr_weight: float = 0.18
+    oi_weight: float = 0.15
+    max_pain_weight: float = 0.10
+    sentiment_weight: float = 0.16
+    gamma_weight: float = 0.10
+
+    # Advanced metrics weights
+    oi_flow_weight: float = 0.12
+    wall_concentration_weight: float = 0.04
+    pcr_strike_alignment_weight: float = 0.08
+    whale_flow_weight: float = 0.05
+
+    # Minimum confidence for valid signal
+    min_confidence: float = 0.4
+
+    # Agreement threshold
+    agreement_threshold: float = 0.6
+
+    # IV value thresholds for crypto
+    iv_high_value: float = 0.80
+    iv_low_value: float = 0.40
+
+
+@dataclass
+class OrchestratorConfig:
+    """Configuration for pipeline orchestrator (orchestrator.py)."""
+
+    # Timing
+    timeout_seconds: int = 600
+    activity_scan_timeout: int = 60
+    data_fetch_timeout: int = 180
+    analysis_timeout: int = 180
+
+    # Selection
+    top_n_assets: int = 5
+    min_activity_score: float = 0.30
+
+    # Signal generation
+    min_signal_confidence: float = 0.50
+    max_signals_per_run: int = 5
+
+    # Signal strength thresholds
+    signal_strength_very_strong: float = 0.80
+    signal_strength_strong: float = 0.65
+    signal_strength_moderate: float = 0.50
+
+    # OI flow thresholds
+    oi_threshold_daily: float = 2.0  # ±2% for daily mode
+    oi_threshold_intraday: float = 1.0  # ±1% for intraday mode
+
+    # Technical analysis defaults
+    atr_fallback_pct: float = 0.5  # ATR fallback when no data
+    max_level_distance_pct: float = 5.0  # Max distance for S/R levels
+    max_tp_distance_pct: float = 5.0  # Max TP distance for intraday
+
+    # Output
+    output_to_stdout: bool = True
+    save_to_database: bool = False
+
+
+@dataclass
+class AssetSelectorConfig:
+    """Configuration for asset selection (asset_selector.py)."""
+
+    top_n: int = 5
+    min_activity_score: float = 0.15
+    min_options_volume: float = 100_000
+    min_active_strikes: int = 5
+    excluded_symbols: list = field(default_factory=list)
+
+
+@dataclass
+class WhaleDetectorAnalyzerConfig:
+    """Configuration for whale detection (whale_detector.py)."""
+
+    # Default premium thresholds
+    min_premium: float = 100_000
+    block_threshold: float = 500_000
+
+    # Analysis settings
+    lookback_hours: int = 24
+    min_trades_for_analysis: int = 3
+
+    # Sentiment thresholds
+    bullish_threshold: float = 0.3
+    bearish_threshold: float = -0.3
+
+
+@dataclass
+class VolumeAnalyzerConfig:
+    """Configuration for volume analyzer (volume_analyzer.py)."""
+
+    # Time buckets for analysis
+    time_buckets: int = 4
+
+    # Concentration thresholds
+    high_concentration_threshold: float = 0.3
+
+
+@dataclass
+class SRLevelCalculatorConfig:
+    """Configuration for S/R level calculation (sr_levels.py)."""
+
+    # Number of levels per side
+    max_support_levels: int = 3
+    max_resistance_levels: int = 3
+
+    # Minimum distance between levels (%)
+    min_level_distance_pct: float = 1.0
+
+    # Weight factors
+    wall_weight: float = 0.50
+    max_pain_weight: float = 0.30
+    volume_weight: float = 0.20
+
+    # Default SL/TP distances
+    default_sl_distance_pct: float = 2.0
+    default_tp_ratios: list = field(default_factory=lambda: [1.5, 3.0, 5.0])
+
+
+@dataclass
+class ActivityScorerConfig:
+    """Configuration for activity scorer (activity_scorer.py)."""
+
+    # Weights for each activity driver
+    weight_oi_change: float = 0.25
+    weight_volume_spike: float = 0.20
+    weight_iv_interest: float = 0.15
+    weight_pcr_extreme: float = 0.15
+    weight_whale_activity: float = 0.15
+    weight_total_volume: float = 0.10
+
+    # Thresholds for normalization
+    oi_change_max: float = 20.0
+    volume_spike_max: float = 5.0
+    total_volume_max: float = 10_000_000
+
+
+@dataclass
 class AnalysisConfig:
     """Options analysis configuration."""
 
@@ -274,6 +523,9 @@ class AnalysisConfig:
     iv_threshold_high: float = 0.75
     iv_threshold_low: float = 0.25
 
+    # Detailed IV Config (for IVAnalyzer)
+    iv_config: IVConfig = field(default_factory=IVConfig)
+
     # PCR
     pcr_enabled: bool = True
     pcr_weight: float = 0.25
@@ -282,18 +534,42 @@ class AnalysisConfig:
     pcr_volume_weight: float = 0.6
     pcr_oi_weight: float = 0.4
 
+    # Detailed PCR Config (for PCRAnalyzer)
+    pcr_analyzer_config: PCRAnalyzerConfig = field(default_factory=PCRAnalyzerConfig)
+
     # OI
     oi_enabled: bool = True
     oi_weight: float = 0.20
     oi_concentration_threshold: float = 0.15
+
+    # Detailed OI Config (for OIAnalyzer)
+    oi_analyzer_config: OIAnalyzerConfig = field(default_factory=OIAnalyzerConfig)
 
     # Max Pain
     max_pain_enabled: bool = True
     max_pain_weight: float = 0.15
     max_pain_distance_threshold: float = 2.0
 
+    # Detailed Max Pain Config (for MaxPainCalculator)
+    max_pain_analyzer_config: MaxPainAnalyzerConfig = field(default_factory=MaxPainAnalyzerConfig)
+
     # Sentiment
     sentiment: SentimentConfig = field(default_factory=SentimentConfig)
+
+    # Wall Detector Config (for WallDetector)
+    wall_detector_config: WallDetectorAnalyzerConfig = field(
+        default_factory=WallDetectorAnalyzerConfig
+    )
+
+    # Gamma Exposure Config (for GammaExposureCalculator)
+    gamma_exposure_config: GammaExposureAnalyzerConfig = field(
+        default_factory=GammaExposureAnalyzerConfig
+    )
+
+    # Signal Scorer Config (for SignalScorer)
+    signal_scorer_config: SignalScorerAnalyzerConfig = field(
+        default_factory=SignalScorerAnalyzerConfig
+    )
 
 
 @dataclass
@@ -412,6 +688,14 @@ class Config:
     output: OutputConfig = field(default_factory=OutputConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
+    # New config sections for analyzer modules
+    orchestrator: OrchestratorConfig = field(default_factory=OrchestratorConfig)
+    asset_selector: AssetSelectorConfig = field(default_factory=AssetSelectorConfig)
+    whale_detector: WhaleDetectorAnalyzerConfig = field(default_factory=WhaleDetectorAnalyzerConfig)
+    volume_analyzer: VolumeAnalyzerConfig = field(default_factory=VolumeAnalyzerConfig)
+    sr_levels: SRLevelCalculatorConfig = field(default_factory=SRLevelCalculatorConfig)
+    activity_scorer: ActivityScorerConfig = field(default_factory=ActivityScorerConfig)
+
     # Path to the config file that was loaded
     config_path: Optional[str] = None
 
@@ -488,6 +772,25 @@ class Config:
 
         if "logging" in data:
             config.logging = cls._parse_logging(data["logging"])
+
+        # Parse new config sections
+        if "orchestrator" in data:
+            config.orchestrator = cls._parse_orchestrator(data["orchestrator"])
+
+        if "asset_selector" in data:
+            config.asset_selector = cls._parse_asset_selector(data["asset_selector"])
+
+        if "whale_detector" in data:
+            config.whale_detector = cls._parse_whale_detector(data["whale_detector"])
+
+        if "volume_analyzer" in data:
+            config.volume_analyzer = cls._parse_volume_analyzer(data["volume_analyzer"])
+
+        if "sr_levels" in data:
+            config.sr_levels = cls._parse_sr_levels(data["sr_levels"])
+
+        if "activity_scorer" in data:
+            config.activity_scorer = cls._parse_activity_scorer(data["activity_scorer"])
 
         return config
 
@@ -609,6 +912,16 @@ class Config:
         max_pain = data.get("max_pain", {})
         sentiment = data.get("sentiment", {})
 
+        # Parse IV config for IVAnalyzer
+        iv_config = IVConfig(
+            iv_high_threshold=iv.get("thresholds", {}).get("high", 0.75),
+            iv_low_threshold=iv.get("thresholds", {}).get("low", 0.25),
+            iv_high_value=iv.get("value_thresholds", {}).get("high", 0.80),
+            iv_low_value=iv.get("value_thresholds", {}).get("low", 0.30),
+            atm_range_pct=iv.get("atm_range_pct", 5.0),
+            min_strikes=iv.get("min_strikes", 3),
+        )
+
         sentiment_config = SentimentConfig(
             enabled=sentiment.get("enabled", True),
             weight=sentiment.get("weight", 0.20),
@@ -629,25 +942,101 @@ class Config:
             contrarian_extreme_threshold=sentiment.get("contrarian_extreme_threshold", 3.0),
         )
 
+        # Parse PCR analyzer config
+        pcr_analyzer = pcr.get("analyzer", {})
+        pcr_analyzer_config = PCRAnalyzerConfig(
+            pcr_high_threshold=pcr_analyzer.get("pcr_high_threshold", 1.2),
+            pcr_low_threshold=pcr_analyzer.get("pcr_low_threshold", 0.8),
+            pcr_extreme_high=pcr_analyzer.get("pcr_extreme_high", 1.5),
+            pcr_extreme_low=pcr_analyzer.get("pcr_extreme_low", 0.5),
+            volume_weight=pcr_analyzer.get("volume_weight", 0.4),
+            min_total_oi=pcr_analyzer.get("min_total_oi", 100),
+        )
+
+        # Parse OI analyzer config
+        oi_analyzer = oi.get("analyzer", {})
+        oi_analyzer_config = OIAnalyzerConfig(
+            high_oi_concentration=oi_analyzer.get("high_oi_concentration", 0.04),
+            significant_oi_change=oi_analyzer.get("significant_oi_change", 0.20),
+            max_strikes_to_analyze=oi_analyzer.get("max_strikes_to_analyze", 50),
+            min_total_oi=oi_analyzer.get("min_total_oi", 100),
+        )
+
+        # Parse Max Pain analyzer config
+        max_pain_analyzer = max_pain.get("analyzer", {})
+        max_pain_analyzer_config = MaxPainAnalyzerConfig(
+            distance_threshold=max_pain_analyzer.get("distance_threshold", 3.0),
+            expiry_weight_factor=max_pain_analyzer.get("expiry_weight_factor", 1.0),
+            min_strikes=max_pain_analyzer.get("min_strikes", 3),
+        )
+
+        # Parse Wall Detector config
+        wall_detector = data.get("wall_detector", {})
+        wall_detector_config = WallDetectorAnalyzerConfig(
+            min_oi_concentration=wall_detector.get("min_oi_concentration", 0.002),
+            major_wall_concentration=wall_detector.get("major_wall_concentration", 0.01),
+            max_wall_distance=wall_detector.get("max_wall_distance", 15.0),
+            min_absolute_oi=wall_detector.get("min_absolute_oi", 10),
+        )
+
+        # Parse Gamma Exposure config
+        gamma_exposure = data.get("gamma_exposure", {})
+        gamma_exposure_config = GammaExposureAnalyzerConfig(
+            significant_level_threshold=gamma_exposure.get("significant_level_threshold", 0.05),
+            min_oi_threshold=gamma_exposure.get("min_oi_threshold", 10),
+            flip_search_range=gamma_exposure.get("flip_search_range", 0.30),
+            use_simplified_delta=gamma_exposure.get("use_simplified_delta", True),
+            dte_reference_days=gamma_exposure.get("dte_reference_days", 7.0),
+            max_dte_weight=gamma_exposure.get("max_dte_weight", 3.0),
+            min_dte_weight=gamma_exposure.get("min_dte_weight", 0.3),
+            enable_dte_weighting=gamma_exposure.get("enable_dte_weighting", True),
+        )
+
+        # Parse Signal Scorer config
+        signal_scorer = data.get("signal_scorer", {})
+        signal_scorer_config = SignalScorerAnalyzerConfig(
+            iv_weight=signal_scorer.get("iv_weight", 0.15),
+            pcr_weight=signal_scorer.get("pcr_weight", 0.18),
+            oi_weight=signal_scorer.get("oi_weight", 0.15),
+            max_pain_weight=signal_scorer.get("max_pain_weight", 0.10),
+            sentiment_weight=signal_scorer.get("sentiment_weight", 0.16),
+            gamma_weight=signal_scorer.get("gamma_weight", 0.10),
+            oi_flow_weight=signal_scorer.get("oi_flow_weight", 0.12),
+            wall_concentration_weight=signal_scorer.get("wall_concentration_weight", 0.04),
+            pcr_strike_alignment_weight=signal_scorer.get("pcr_strike_alignment_weight", 0.08),
+            whale_flow_weight=signal_scorer.get("whale_flow_weight", 0.05),
+            min_confidence=signal_scorer.get("min_confidence", 0.4),
+            agreement_threshold=signal_scorer.get("agreement_threshold", 0.6),
+            iv_high_value=signal_scorer.get("iv_high_value", 0.80),
+            iv_low_value=signal_scorer.get("iv_low_value", 0.40),
+        )
+
         return AnalysisConfig(
             iv_enabled=iv.get("enabled", True),
             iv_weight=iv.get("weight", 0.20),
             iv_lookback_days=iv.get("lookback_days", 30),
             iv_threshold_high=iv.get("thresholds", {}).get("high", 0.75),
             iv_threshold_low=iv.get("thresholds", {}).get("low", 0.25),
+            iv_config=iv_config,
             pcr_enabled=pcr.get("enabled", True),
             pcr_weight=pcr.get("weight", 0.25),
             pcr_threshold_put_high=pcr.get("thresholds", {}).get("put_high", 1.2),
             pcr_threshold_call_high=pcr.get("thresholds", {}).get("call_high", 0.8),
             pcr_volume_weight=pcr.get("weighting", {}).get("volume_weight", 0.6),
             pcr_oi_weight=pcr.get("weighting", {}).get("oi_weight", 0.4),
+            pcr_analyzer_config=pcr_analyzer_config,
             oi_enabled=oi.get("enabled", True),
             oi_weight=oi.get("weight", 0.20),
             oi_concentration_threshold=oi.get("concentration_threshold", 0.15),
+            oi_analyzer_config=oi_analyzer_config,
             max_pain_enabled=max_pain.get("enabled", True),
             max_pain_weight=max_pain.get("weight", 0.15),
             max_pain_distance_threshold=max_pain.get("distance_threshold", 2.0),
+            max_pain_analyzer_config=max_pain_analyzer_config,
             sentiment=sentiment_config,
+            wall_detector_config=wall_detector_config,
+            gamma_exposure_config=gamma_exposure_config,
+            signal_scorer_config=signal_scorer_config,
         )
 
     @staticmethod
@@ -736,6 +1125,97 @@ class Config:
             console_enabled=console.get("enabled", False),
             console_colorize=console.get("colorize", False),
             mask_sensitive=data.get("mask_sensitive", True),
+        )
+
+    @staticmethod
+    def _parse_orchestrator(data: Dict) -> OrchestratorConfig:
+        """Parse orchestrator section."""
+        return OrchestratorConfig(
+            timeout_seconds=data.get("timeout_seconds", 600),
+            activity_scan_timeout=data.get("activity_scan_timeout", 60),
+            data_fetch_timeout=data.get("data_fetch_timeout", 180),
+            analysis_timeout=data.get("analysis_timeout", 180),
+            top_n_assets=data.get("top_n_assets", 5),
+            min_activity_score=data.get("min_activity_score", 0.30),
+            min_signal_confidence=data.get("min_signal_confidence", 0.50),
+            max_signals_per_run=data.get("max_signals_per_run", 5),
+            # Signal strength thresholds
+            signal_strength_very_strong=data.get("signal_strength_very_strong", 0.80),
+            signal_strength_strong=data.get("signal_strength_strong", 0.65),
+            signal_strength_moderate=data.get("signal_strength_moderate", 0.50),
+            # OI flow thresholds
+            oi_threshold_daily=data.get("oi_threshold_daily", 2.0),
+            oi_threshold_intraday=data.get("oi_threshold_intraday", 1.0),
+            # Technical analysis defaults
+            atr_fallback_pct=data.get("atr_fallback_pct", 0.5),
+            max_level_distance_pct=data.get("max_level_distance_pct", 5.0),
+            max_tp_distance_pct=data.get("max_tp_distance_pct", 5.0),
+            # Output
+            output_to_stdout=data.get("output_to_stdout", True),
+            save_to_database=data.get("save_to_database", False),
+        )
+
+    @staticmethod
+    def _parse_asset_selector(data: Dict) -> AssetSelectorConfig:
+        """Parse asset_selector section."""
+        return AssetSelectorConfig(
+            top_n=data.get("top_n", 5),
+            min_activity_score=data.get("min_activity_score", 0.15),
+            min_options_volume=data.get("min_options_volume", 100_000),
+            min_active_strikes=data.get("min_active_strikes", 5),
+            excluded_symbols=data.get("excluded_symbols", []),
+        )
+
+    @staticmethod
+    def _parse_whale_detector(data: Dict) -> WhaleDetectorAnalyzerConfig:
+        """Parse whale_detector section."""
+        return WhaleDetectorAnalyzerConfig(
+            min_premium=data.get("min_premium", 100_000),
+            block_threshold=data.get("block_threshold", 500_000),
+            lookback_hours=data.get("lookback_hours", 24),
+            min_trades_for_analysis=data.get("min_trades_for_analysis", 3),
+            bullish_threshold=data.get("bullish_threshold", 0.3),
+            bearish_threshold=data.get("bearish_threshold", -0.3),
+        )
+
+    @staticmethod
+    def _parse_volume_analyzer(data: Dict) -> VolumeAnalyzerConfig:
+        """Parse volume_analyzer section."""
+        return VolumeAnalyzerConfig(
+            time_buckets=data.get("time_buckets", 4),
+            high_concentration_threshold=data.get("high_concentration_threshold", 0.3),
+        )
+
+    @staticmethod
+    def _parse_sr_levels(data: Dict) -> SRLevelCalculatorConfig:
+        """Parse sr_levels section."""
+        return SRLevelCalculatorConfig(
+            max_support_levels=data.get("max_support_levels", 3),
+            max_resistance_levels=data.get("max_resistance_levels", 3),
+            min_level_distance_pct=data.get("min_level_distance_pct", 1.0),
+            wall_weight=data.get("wall_weight", 0.50),
+            max_pain_weight=data.get("max_pain_weight", 0.30),
+            volume_weight=data.get("volume_weight", 0.20),
+            default_sl_distance_pct=data.get("default_sl_distance_pct", 2.0),
+            default_tp_ratios=data.get("default_tp_ratios", [1.5, 3.0, 5.0]),
+        )
+
+    @staticmethod
+    def _parse_activity_scorer(data: Dict) -> ActivityScorerConfig:
+        """Parse activity_scorer section."""
+        weights = data.get("weights", {})
+        thresholds = data.get("thresholds", {})
+
+        return ActivityScorerConfig(
+            weight_oi_change=weights.get("oi_change", 0.25),
+            weight_volume_spike=weights.get("volume_spike", 0.20),
+            weight_iv_interest=weights.get("iv_interest", 0.15),
+            weight_pcr_extreme=weights.get("pcr_extreme", 0.15),
+            weight_whale_activity=weights.get("whale_activity", 0.15),
+            weight_total_volume=weights.get("total_volume", 0.10),
+            oi_change_max=thresholds.get("oi_change_max", 20.0),
+            volume_spike_max=thresholds.get("volume_spike_max", 5.0),
+            total_volume_max=thresholds.get("total_volume_max", 10_000_000),
         )
 
 

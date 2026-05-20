@@ -144,14 +144,23 @@ walls:
 # OPTIONS ANALYSIS
 # ============================================================
 analysis:
-  # IV Analysis
+  # IV (Implied Volatility) Analysis
   iv:
     enabled: true
     weight: 0.20
     lookback_days: 30
+    # Percentile thresholds (for IV percentile ranking)
     thresholds:
-      high: 0.75
-      low: 0.25
+      high: 0.75                 # 75th percentile = high IV
+      low: 0.25                  # 25th percentile = low IV
+    # Value thresholds (annualized IV values)
+    value_thresholds:
+      high: 0.80                 # 80% annualized = high IV
+      low: 0.30                  # 30% annualized = low IV
+    # ATM range for IV calculation
+    atm_range_pct: 5.0           # 5% from spot price
+    # Minimum strikes for valid analysis
+    min_strikes: 3               # Minimum strikes required
   
   # PCR Analysis
   pcr:
@@ -163,18 +172,37 @@ analysis:
     weighting:
       volume_weight: 0.6
       oi_weight: 0.4
+    # PCR Analyzer Config (pcr_analyzer.py)
+    analyzer:
+      pcr_high_threshold: 1.2        # Put-heavy
+      pcr_low_threshold: 0.8         # Call-heavy
+      pcr_extreme_high: 1.5          # Very put-heavy
+      pcr_extreme_low: 0.5           # Very call-heavy
+      volume_weight: 0.4             # 40% notional PCR, 60% OI PCR
+      min_total_oi: 100              # Minimum OI for valid analysis
   
   # Open Interest
   oi:
     enabled: true
     weight: 0.20
     concentration_threshold: 0.15
+    # OI Analyzer Config (oi_analyzer.py)
+    analyzer:
+      high_oi_concentration: 0.04    # 4% of total OI at one strike
+      significant_oi_change: 0.20    # 20% change is significant
+      max_strikes_to_analyze: 50
+      min_total_oi: 100
   
   # Max Pain
   max_pain:
     enabled: true
     weight: 0.15
     distance_threshold: 2.0
+    # Max Pain Analyzer Config (max_pain.py)
+    analyzer:
+      distance_threshold: 3.0        # 3% from max pain
+      expiry_weight_factor: 1.0      # Weight by days to expiry
+      min_strikes: 3
   
   # Sentiment Analysis (L/S Ratios + Funding Rate)
   sentiment:
@@ -299,6 +327,143 @@ logging:
     colorize: false
   
   mask_sensitive: true
+
+# ============================================================
+# ORCHESTRATOR CONFIG (orchestrator.py)
+# ============================================================
+orchestrator:
+  # Timing
+  timeout_seconds: 600
+  activity_scan_timeout: 60
+  data_fetch_timeout: 180
+  analysis_timeout: 180
+  
+  # Asset selection
+  top_n_assets: 5
+  min_activity_score: 0.30
+  
+  # Signal generation
+  min_signal_confidence: 0.50
+  max_signals_per_run: 5
+  
+  # Signal strength thresholds (confidence levels)
+  signal_strength_very_strong: 0.80   # >= 80% confidence
+  signal_strength_strong: 0.65        # >= 65% confidence
+  signal_strength_moderate: 0.50      # >= 50% confidence
+  
+  # OI flow thresholds (for OI change detection)
+  oi_threshold_daily: 2.0             # ±2% for daily mode
+  oi_threshold_intraday: 1.0          # ±1% for intraday mode
+  
+  # Technical analysis defaults
+  atr_fallback_pct: 0.5               # ATR fallback when no data available
+  max_level_distance_pct: 5.0         # Max distance for S/R levels from spot
+  max_tp_distance_pct: 5.0            # Max TP distance for intraday
+  
+  # Output
+  output_to_stdout: true
+  save_to_database: false
+
+# ============================================================
+# ASSET SELECTOR CONFIG (asset_selector.py)
+# ============================================================
+asset_selector:
+  top_n: 5
+  min_activity_score: 0.15
+  min_options_volume: 100000      # $100K minimum
+  min_active_strikes: 5
+  excluded_symbols: []             # Symbols to never select
+
+# ============================================================
+# WHALE DETECTOR CONFIG (whale_detector.py)
+# ============================================================
+whale_detector:
+  min_premium: 100000              # $100k for regular whale
+  block_threshold: 500000          # $500k for block trade
+  lookback_hours: 24
+  min_trades_for_analysis: 3
+  bullish_threshold: 0.3           # 30% net bullish = bullish
+  bearish_threshold: -0.3          # 30% net bearish = bearish
+
+# ============================================================
+# VOLUME ANALYZER CONFIG (volume_analyzer.py)
+# ============================================================
+volume_analyzer:
+  time_buckets: 4                  # Divide lookback into 4 buckets
+  high_concentration_threshold: 0.3  # 30% at one strike
+
+# ============================================================
+# S/R LEVELS CONFIG (sr_levels.py)
+# ============================================================
+sr_levels:
+  max_support_levels: 3
+  max_resistance_levels: 3
+  min_level_distance_pct: 1.0      # Minimum distance between levels
+  wall_weight: 0.50
+  max_pain_weight: 0.30
+  volume_weight: 0.20
+  default_sl_distance_pct: 2.0
+  default_tp_ratios: [1.5, 3.0, 5.0]
+
+# ============================================================
+# ACTIVITY SCORER CONFIG (activity_scorer.py)
+# ============================================================
+activity_scorer:
+  weights:
+    oi_change: 0.25
+    volume_spike: 0.20
+    iv_interest: 0.15
+    pcr_extreme: 0.15
+    whale_activity: 0.15
+    total_volume: 0.10
+  thresholds:
+    oi_change_max: 20.0            # 20% OI change = max score
+    volume_spike_max: 5.0          # 5x avg volume = max score
+    total_volume_max: 10000000     # $10M volume = max score
+
+# ============================================================
+# WALL DETECTOR CONFIG (wall_detector.py)
+# ============================================================
+wall_detector:
+  min_oi_concentration: 0.002      # 0.2% of total OI
+  major_wall_concentration: 0.01   # 1% of total OI
+  max_wall_distance: 15.0          # 15% from spot
+  min_absolute_oi: 10
+
+# ============================================================
+# GAMMA EXPOSURE CONFIG (gamma_exposure.py)
+# ============================================================
+gamma_exposure:
+  significant_level_threshold: 0.05  # 5% of total
+  min_oi_threshold: 10
+  flip_search_range: 0.30          # ±30% from spot
+  use_simplified_delta: true
+  dte_reference_days: 7.0
+  max_dte_weight: 3.0
+  min_dte_weight: 0.3
+  enable_dte_weighting: true
+
+# ============================================================
+# SIGNAL SCORER CONFIG (signal_scorer.py)
+# ============================================================
+signal_scorer:
+  # Core weights for each signal type
+  iv_weight: 0.15
+  pcr_weight: 0.18
+  oi_weight: 0.15
+  max_pain_weight: 0.10
+  sentiment_weight: 0.16
+  gamma_weight: 0.10
+  # Advanced metrics weights
+  oi_flow_weight: 0.12
+  wall_concentration_weight: 0.04
+  pcr_strike_alignment_weight: 0.08
+  whale_flow_weight: 0.05
+  # Thresholds
+  min_confidence: 0.4
+  agreement_threshold: 0.6
+  iv_high_value: 0.80
+  iv_low_value: 0.40
 
 # ============================================================
 # NOTE: External Components

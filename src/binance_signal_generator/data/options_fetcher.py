@@ -19,10 +19,7 @@ from collections import defaultdict
 import re
 
 from binance_common.configuration import ConfigurationRestAPI
-from binance_common.constants import (
-    DERIVATIVES_TRADING_OPTIONS_REST_API_PROD_URL,
-    DERIVATIVES_TRADING_OPTIONS_REST_API_TESTNET_URL,
-)
+from binance_common.constants import DERIVATIVES_TRADING_OPTIONS_REST_API_PROD_URL
 from binance_sdk_derivatives_trading_options.derivatives_trading_options import (
     DerivativesTradingOptions,
 )
@@ -59,9 +56,7 @@ class OptionsFetcher:
 
     # Binance Options API base URLs
     MAINNET_URL = DERIVATIVES_TRADING_OPTIONS_REST_API_PROD_URL  # https://eapi.binance.com
-    TESTNET_URL = (
-        DERIVATIVES_TRADING_OPTIONS_REST_API_TESTNET_URL  # https://testnet.eapi.binance.com
-    )
+    TESTNET_URL = "https://testnet.binanceops.com"
 
     def __init__(
         self,

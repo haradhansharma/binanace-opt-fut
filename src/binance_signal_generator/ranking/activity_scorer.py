@@ -23,6 +23,7 @@ from binance_signal_generator.models import (
     ActivityDriver,
     OptionsChain,
 )
+from binance_signal_generator.config import load_config, ActivityScorerConfig
 from binance_signal_generator.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -31,6 +32,7 @@ logger = get_logger(__name__)
 @dataclass
 class ActivityScanResult:
     """Result of activity scan across all assets."""
+
     timestamp: datetime
     total_assets_scanned: int
     metrics_by_symbol: Dict[str, ActivityMetrics]
@@ -41,66 +43,59 @@ class ActivityScanResult:
 class ActivityScorer:
     """
     Scores assets by Options market activity level.
-    
+
     Purpose:
         Quickly scan all assets to identify which have the most
         interesting Options activity for detailed analysis.
-    
+
     Activity Score Formula:
-        score = w1*oi_change + w2*volume_spike + w3*iv_percentile 
+        score = w1*oi_change + w2*volume_spike + w3*iv_percentile
               + w4*pcr_extreme + w5*whale_activity + w6*total_volume
-    
+
     Attributes:
-        weights: Weight for each activity driver
-        oi_change_max: Max OI change % for normalization (default 20%)
-        volume_spike_max: Max volume spike multiplier (default 5x)
-        total_volume_max: Max total volume in $ for normalization
+        config: Activity scorer configuration (loaded from config.yaml)
     """
-    
-    DEFAULT_WEIGHTS: Dict[ActivityDriver, float] = {
-        ActivityDriver.OI_CHANGE: 0.25,
-        ActivityDriver.VOLUME_SPIKE: 0.20,
-        ActivityDriver.IV_INTEREST: 0.15,
-        ActivityDriver.PCR_EXTREME: 0.15,
-        ActivityDriver.WHALE_ACTIVITY: 0.15,
-        ActivityDriver.TOTAL_VOLUME: 0.10,
-    }
-    
-    def __init__(
-        self,
-        weights: Optional[Dict[ActivityDriver, float]] = None,
-        oi_change_max: float = 20.0,
-        volume_spike_max: float = 5.0,
-        total_volume_max: float = 10_000_000,  # $10M (lowered for options)
-    ):
+
+    def __init__(self, config_path: Optional[str] = None):
         """
         Initialize activity scorer.
-        
+
+        Config is loaded from config.yaml via load_config().
+        Single source of truth - no fallback defaults.
+
         Args:
-            weights: Custom weights for activity drivers
-            oi_change_max: Max OI change % for normalization
-            volume_spike_max: Max volume spike multiplier
-            total_volume_max: Max total volume in $ for normalization
+            config_path: Optional path to config file
         """
-        self.weights = weights or self.DEFAULT_WEIGHTS.copy()
-        self.oi_change_max = oi_change_max
-        self.volume_spike_max = volume_spike_max
-        self.total_volume_max = total_volume_max
-        
+        loaded_config = load_config(config_path)
+        self.config = loaded_config.activity_scorer
+
+        # Build weights dict from config
+        self.weights = {
+            ActivityDriver.OI_CHANGE: self.config.weight_oi_change,
+            ActivityDriver.VOLUME_SPIKE: self.config.weight_volume_spike,
+            ActivityDriver.IV_INTEREST: self.config.weight_iv_interest,
+            ActivityDriver.PCR_EXTREME: self.config.weight_pcr_extreme,
+            ActivityDriver.WHALE_ACTIVITY: self.config.weight_whale_activity,
+            ActivityDriver.TOTAL_VOLUME: self.config.weight_total_volume,
+        }
+        self.oi_change_max = self.config.oi_change_max
+        self.volume_spike_max = self.config.volume_spike_max
+        self.total_volume_max = self.config.total_volume_max
+
         logger.info(
             "Activity scorer initialized",
-            extra={"data": {"weights": {k.value: v for k, v in self.weights.items()}}}
+            extra={"data": {"weights": {k.value: v for k, v in self.weights.items()}}},
         )
-    
+
     def calculate_score(self, metrics: ActivityMetrics) -> float:
         """
         Calculate normalized activity score (0-1).
-        
+
         Higher score = More interesting activity.
-        
+
         Args:
             metrics: Activity metrics for an asset
-            
+
         Returns:
             Score between 0 and 1
         """
@@ -111,31 +106,31 @@ class ActivityScorer:
         pcr_norm = metrics.pcr_extremeness
         whale_norm = metrics.whale_activity
         volume_total_norm = min(metrics.total_options_volume / self.total_volume_max, 1.0)
-        
+
         # Weighted sum
         score = (
-            self.weights[ActivityDriver.OI_CHANGE] * oi_change_norm +
-            self.weights[ActivityDriver.VOLUME_SPIKE] * volume_norm +
-            self.weights[ActivityDriver.IV_INTEREST] * iv_norm +
-            self.weights[ActivityDriver.PCR_EXTREME] * pcr_norm +
-            self.weights[ActivityDriver.WHALE_ACTIVITY] * whale_norm +
-            self.weights[ActivityDriver.TOTAL_VOLUME] * volume_total_norm
+            self.weights[ActivityDriver.OI_CHANGE] * oi_change_norm
+            + self.weights[ActivityDriver.VOLUME_SPIKE] * volume_norm
+            + self.weights[ActivityDriver.IV_INTEREST] * iv_norm
+            + self.weights[ActivityDriver.PCR_EXTREME] * pcr_norm
+            + self.weights[ActivityDriver.WHALE_ACTIVITY] * whale_norm
+            + self.weights[ActivityDriver.TOTAL_VOLUME] * volume_total_norm
         )
-        
+
         logger.debug(
             f"Activity score for {metrics.symbol}: {score:.3f} "
             f"(vol={metrics.total_options_volume:.0f}, pcr={pcr_norm:.3f})"
         )
-        
+
         return min(score, 1.0)
-    
+
     def identify_primary_driver(self, metrics: ActivityMetrics) -> ActivityDriver:
         """
         Identify which metric is driving the most activity.
-        
+
         Args:
             metrics: Activity metrics for an asset
-            
+
         Returns:
             The ActivityDriver with highest contribution
         """
@@ -150,23 +145,23 @@ class ActivityScorer:
                 metrics.total_options_volume / self.total_volume_max, 1.0
             ),
         }
-        
+
         return max(contributions, key=contributions.get)
-    
+
     def score_metrics(self, metrics: ActivityMetrics) -> ActivityMetrics:
         """
         Calculate and populate score in metrics object.
-        
+
         Args:
             metrics: Activity metrics to score
-            
+
         Returns:
             The same metrics object with score populated
         """
         metrics.activity_score = self.calculate_score(metrics)
         metrics.primary_driver = self.identify_primary_driver(metrics).value
         return metrics
-    
+
     def score_from_chain(
         self,
         chain: OptionsChain,
@@ -197,10 +192,13 @@ class ActivityScorer:
         # ($10M by default) which is a USDT amount. Using contract count would
         # make volume_total_norm ≈ 0 for all assets (5000 contracts / $10M = 0.0005).
         total_volume_notional = chain.total_call_notional + chain.total_put_notional
-        active_strikes = len([
-            s for s in chain.strikes.values()
-            if s.call.open_interest > 0 or s.put.open_interest > 0
-        ])
+        active_strikes = len(
+            [
+                s
+                for s in chain.strikes.values()
+                if s.call.open_interest > 0 or s.put.open_interest > 0
+            ]
+        )
 
         # Calculate PCR extremeness
         pcr = chain.get_pcr()
@@ -224,61 +222,61 @@ class ActivityScorer:
 
         # Score the metrics
         return self.score_metrics(metrics)
-    
+
     def _calc_pcr_extremeness(self, pcr: float) -> float:
         """
         Calculate how extreme PCR is.
-        
+
         PCR = 1.0 is neutral.
         PCR > 1.5 or < 0.5 is very extreme.
-        
+
         Args:
             pcr: Put/Call ratio
-            
+
         Returns:
             Extremeness score (0-1)
         """
         if pcr <= 0:
             return 0.0
-        
+
         if pcr > 1.0:
             # Put heavy - scale: 1.0 -> 0, 1.5 -> 1.0
             return min((pcr - 1.0) / 0.5, 1.0)
         else:
             # Call heavy - scale: 1.0 -> 0, 0.5 -> 1.0
             return min((1.0 - pcr) / 0.5, 1.0)
-    
+
     def _estimate_iv_percentile(self, chain: OptionsChain) -> float:
         """
         Calculate IV percentile from options chain.
-        
+
         Uses the average IV from mark prices (real data from API).
         The IV is returned as decimal (e.g., 1.45 = 145% annualized).
-        
+
         Args:
             chain: Options chain with avg_call_iv and avg_put_iv populated
-            
+
         Returns:
             IV percentile (0-1) based on typical crypto IV ranges
         """
         # Use average IV from chain (populated from mark price API)
         avg_iv = chain.avg_call_iv if chain.avg_call_iv > 0 else chain.avg_put_iv
-        
+
         # If both are available, use weighted average
         if chain.avg_call_iv > 0 and chain.avg_put_iv > 0:
             avg_iv = (chain.avg_call_iv + chain.avg_put_iv) / 2
-        
+
         if avg_iv == 0:
             return 0.5  # Default neutral if no IV data
-        
+
         # IV normalization for crypto options
         # Binance returns IV as decimal (1.45 = 145% annualized)
         # Typical crypto IV ranges:
         # - Low IV: < 50% (0.50 decimal)
-        # - Normal IV: 50-100% (0.50-1.00 decimal)  
+        # - Normal IV: 50-100% (0.50-1.00 decimal)
         # - High IV: > 100% (1.00 decimal)
         # Very high IV: > 150% (1.50 decimal)
-        
+
         if avg_iv < 0.5:
             return 0.2  # Low IV
         elif avg_iv < 0.75:
@@ -291,26 +289,26 @@ class ActivityScorer:
             return 0.8  # High IV
         else:
             return 0.95  # Very high IV
-    
+
     def rank_assets(
         self,
         metrics_list: List[ActivityMetrics],
     ) -> List[ActivityMetrics]:
         """
         Rank assets by activity score.
-        
+
         Args:
             metrics_list: List of activity metrics
-            
+
         Returns:
             List sorted by score (highest first)
         """
         # Score all metrics
         scored = [self.score_metrics(m) for m in metrics_list]
-        
+
         # Sort by score descending
         return sorted(scored, key=lambda m: m.activity_score, reverse=True)
-    
+
     def get_top_assets(
         self,
         metrics_list: List[ActivityMetrics],
@@ -319,29 +317,29 @@ class ActivityScorer:
     ) -> List[ActivityMetrics]:
         """
         Get top N assets by activity score.
-        
+
         Args:
             metrics_list: List of activity metrics
             n: Number of top assets to return
             min_score: Minimum score threshold
-            
+
         Returns:
             List of top N metrics
         """
         ranked = self.rank_assets(metrics_list)
-        
+
         # Filter by minimum score
         filtered = [m for m in ranked if m.activity_score >= min_score]
-        
+
         return filtered[:n]
-    
+
     def get_activity_summary(self, metrics: ActivityMetrics) -> Dict[str, Any]:
         """
         Get a summary of activity for an asset.
-        
+
         Args:
             metrics: Activity metrics
-            
+
         Returns:
             Dictionary with activity summary
         """

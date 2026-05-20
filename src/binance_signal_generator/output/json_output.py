@@ -37,47 +37,47 @@ logger = get_logger(__name__)
 class JSONOutputEncoder(json.JSONEncoder):
     """
     Custom JSON encoder for handling special types.
-    
+
     Handles:
     - datetime objects
     - Enum values
     - Float precision
     - None values
     """
-    
+
     def default(self, obj: Any) -> Any:
         """Convert special types to JSON-serializable format."""
         if isinstance(obj, datetime):
             return obj.isoformat() + "Z"
-        
+
         if hasattr(obj, "value"):  # Enum
             return obj.value
-        
+
         if hasattr(obj, "__dict__"):
             return obj.__dict__
-        
+
         if isinstance(obj, float):
             # Round to avoid floating point issues
             return round(obj, 8)
-        
+
         return super().default(obj)
 
 
 class JSONOutput:
     """
     Handles JSON output for signal generation results.
-    
+
     Features:
     - Compact or pretty output
     - stdout or file output
     - Signal-specific formatting
     - Metadata enrichment
     - Full OutputConfig support
-    
+
     Attributes:
         config: OutputConfig object with all settings
     """
-    
+
     def __init__(
         self,
         pretty: bool = False,
@@ -88,7 +88,7 @@ class JSONOutput:
     ):
         """
         Initialize JSON output handler.
-        
+
         Args:
             pretty: Enable pretty printing with indentation
             output_file: Optional file path to write output
@@ -108,43 +108,45 @@ class JSONOutput:
             self.include_metadata = include_metadata
             self.include_selected_assets = include_selected_assets
             self.config = None
-        
+
         logger.debug(
             "JSON output initialized",
-            extra={"data": {
-                "pretty": self.pretty,
-                "output_file": self.output_file,
-                "include_metadata": self.include_metadata,
-                "include_selected_assets": self.include_selected_assets,
-            }}
+            extra={
+                "data": {
+                    "pretty": self.pretty,
+                    "output_file": self.output_file,
+                    "include_metadata": self.include_metadata,
+                    "include_selected_assets": self.include_selected_assets,
+                }
+            },
         )
-    
+
     def output(self, result: ExecutionResult) -> None:
         """
         Output execution result as JSON.
-        
+
         Args:
             result: Execution result to output
         """
         json_str = self.serialize(result)
-        
+
         if self.output_file:
             self._write_to_file(json_str)
         else:
             self._write_to_stdout(json_str)
-    
+
     def serialize(self, result: ExecutionResult) -> str:
         """
         Serialize execution result to JSON string.
-        
+
         Args:
             result: Execution result
-            
+
         Returns:
             JSON string
         """
         data = self._prepare_output(result)
-        
+
         indent = 2 if self.pretty else None
         return json.dumps(
             data,
@@ -152,14 +154,14 @@ class JSONOutput:
             indent=indent,
             ensure_ascii=False,
         )
-    
+
     def _prepare_output(self, result: ExecutionResult) -> Dict[str, Any]:
         """
         Prepare execution result for JSON output.
-        
+
         Args:
             result: Execution result
-            
+
         Returns:
             Dictionary ready for JSON serialization
         """
@@ -171,7 +173,7 @@ class JSONOutput:
             "signals_generated": result.signals_generated,
             "signals": [self._format_signal(s) for s in result.signals],
         }
-        
+
         if self.include_metadata:
             output["metadata"] = {
                 "config_file": result.config_path,
@@ -179,19 +181,19 @@ class JSONOutput:
                 "data_freshness_seconds": result.data_freshness_seconds,
                 "errors": result.errors,
             }
-        
+
         if self.include_selected_assets:
             output["selected_assets"] = result.selected_assets
-        
+
         return output
-    
+
     def _format_signal(self, signal: TradingSignal) -> Dict[str, Any]:
         """
         Format a trading signal for JSON output.
-        
+
         Args:
             signal: Trading signal
-            
+
         Returns:
             Formatted dictionary
         """
@@ -201,19 +203,16 @@ class JSONOutput:
             "symbol": signal.symbol,
             "asset_rank": signal.asset_rank,
             "activity_score": round(signal.activity_score, 3),
-            
             # Direction and confidence
             "direction": signal.direction.value,
             "confidence_score": round(signal.confidence_score, 3),
             "signal_strength": signal.signal_strength.value,
-            
             # Entry zone
             "entry_zone": {
                 "min": round(signal.entry_zone.min, 4),
                 "max": round(signal.entry_zone.max, 4),
                 "ideal": round(signal.entry_zone.ideal, 4),
             },
-            
             # Stop loss
             "stop_loss": {
                 "price": round(signal.stop_loss.price, 4),
@@ -222,7 +221,6 @@ class JSONOutput:
                 "source_strike": signal.stop_loss.source_strike,
                 "confidence": round(signal.stop_loss.confidence, 2),
             },
-            
             # Take profit levels
             "take_profit_levels": [
                 {
@@ -235,11 +233,9 @@ class JSONOutput:
                 }
                 for tp in signal.take_profit_levels
             ],
-            
             # Support and resistance
             "support_levels": signal.support_levels,
             "resistance_levels": signal.resistance_levels,
-            
             # Metrics
             "whale_metrics": signal.whale_metrics,
             "options_metrics": {
@@ -250,46 +246,45 @@ class JSONOutput:
                 k: round(v, 4) if isinstance(v, float) else v
                 for k, v in signal.futures_metrics.items()
             },
-            
             # Risk/reward
             "risk_reward_ratio": round(signal.risk_reward_ratio, 2),
         }
-    
+
     def _write_to_stdout(self, json_str: str) -> None:
         """
         Write JSON to stdout.
-        
+
         Args:
             json_str: JSON string to write
         """
         print(json_str)
         logger.debug("Output written to stdout")
-    
+
     def _write_to_file(self, json_str: str) -> None:
         """
         Write JSON to file.
-        
+
         Args:
             json_str: JSON string to write
         """
         path = Path(self.output_file)
-        
+
         # Ensure directory exists
         path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # Write file
         path.write_text(json_str, encoding="utf-8")
-        
+
         logger.info(f"Output written to {self.output_file}")
-    
+
     @staticmethod
     def format_signal_compact(signal: TradingSignal) -> Dict[str, Any]:
         """
         Format signal in compact form for quick viewing.
-        
+
         Args:
             signal: Trading signal
-            
+
         Returns:
             Compact dictionary
         """
@@ -299,29 +294,33 @@ class JSONOutput:
             "confidence": round(signal.confidence_score, 2),
             "entry": round(signal.entry_zone.ideal, 4),
             "sl": round(signal.stop_loss.price, 4),
-            "tp1": round(signal.take_profit_levels[0].price, 4) if signal.take_profit_levels else None,
+            "tp1": round(signal.take_profit_levels[0].price, 4)
+            if signal.take_profit_levels
+            else None,
             "rr": round(signal.risk_reward_ratio, 2),
         }
-    
+
     @staticmethod
     def format_signals_table(signals: List[TradingSignal]) -> str:
         """
         Format signals as a text table for console display.
-        
+
         Args:
             signals: List of trading signals
-            
+
         Returns:
             Formatted table string
         """
         if not signals:
             return "No signals generated"
-        
+
         lines = []
         lines.append("=" * 80)
-        lines.append(f"{'Symbol':<12} {'Dir':<6} {'Conf':<6} {'Entry':<12} {'SL':<12} {'TP1':<12} {'RR':<5}")
+        lines.append(
+            f"{'Symbol':<12} {'Dir':<6} {'Conf':<6} {'Entry':<12} {'SL':<12} {'TP1':<12} {'RR':<5}"
+        )
         lines.append("-" * 80)
-        
+
         for s in signals:
             tp1 = s.take_profit_levels[0].price if s.take_profit_levels else 0
             lines.append(
@@ -333,9 +332,9 @@ class JSONOutput:
                 f"{tp1:<12.4f} "
                 f"{s.risk_reward_ratio:<5.2f}"
             )
-        
+
         lines.append("=" * 80)
-        
+
         return "\n".join(lines)
 
 
@@ -348,7 +347,7 @@ def output_signals(
 ) -> None:
     """
     Convenience function to output signals.
-    
+
     Args:
         result: Execution result
         pretty: Pretty print JSON
@@ -369,10 +368,10 @@ def output_signals(
 def get_output_summary(result: ExecutionResult) -> Dict[str, Any]:
     """
     Get a summary of the output for logging.
-    
+
     Args:
         result: Execution result
-        
+
     Returns:
         Summary dictionary
     """

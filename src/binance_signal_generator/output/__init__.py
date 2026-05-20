@@ -11,10 +11,7 @@ from binance_signal_generator.output.json_output import (
     output_signals,
     get_output_summary,
 )
-from binance_signal_generator.output.sr_levels import (
-    SRLevelCalculator,
-    SRLevelConfig,
-)
+from binance_signal_generator.output.sr_levels import SRLevelCalculator
 
 __all__ = [
     "JSONOutput",
@@ -22,5 +19,4 @@ __all__ = [
     "output_signals",
     "get_output_summary",
     "SRLevelCalculator",
-    "SRLevelConfig",
 ]
